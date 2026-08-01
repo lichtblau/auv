@@ -1,0 +1,93 @@
+# Builds auv and runs the uv test suite (./tests/uv/run.sh, both optimization levels) plus the
+# examples, on every PR and every push to main.
+#
+# The Ante compiler comes from a bare docker image published by the compiler repo's release
+# workflow (lichtblau/ante, branch `fork`): a static-musl `ante` binary plus the precompiled
+# `minicoro.o` it links into every program. The image contains nothing else -- no shell, no
+# libc -- so it is never run; the two artifacts are copied out of it.
+#
+# THREE locations have to line up before scripts/lib.sh can build anything, and only the last
+# one is ours to choose:
+#
+#   * /minicoro.o and /home/runner/work/ante/ante/stdlib are BAKED INTO the binary when the
+#     compiler itself is built (option_env! in its src/paths.rs -- there is no runtime
+#     override). The first is set explicitly by the release workflow; the second is just the
+#     compiler repo's own CI workspace. The image ships no stdlib (.an sources), so the
+#     compiler repo is checked out at the same commit and both paths are materialized below.
+#
+#   * minicoro.h, which src/Uv/csrc/pc_coro.c includes, is found by `aminicoro_include` in
+#     scripts/lib.sh -- which walks up from whatever `ante` is on PATH (<ante>/../../aminicoro,
+#     the layout a cargo build leaves) rather than assuming a checkout location. So the binary
+#     extracted from the image is placed at ante-compiler/target/release/ante INSIDE the
+#     compiler checkout, whose `aminicoro` submodule supplies the header. That placement is the
+#     whole reason the checkout is a full one with submodules rather than a sparse stdlib.
+#
+# Having the compiler checkout inside the workspace is harmless: `ante build` parses only the
+# .an files of the project it is building and of its deps/, and both auv projects (tests/uv,
+# examples) reach the library through their deps/Auv symlink.
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  ANTE_COMMIT: 723316a7cf0e86ef4e2c024c3c55c450fcbeac94
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # The compiler's own sources at the exact commit the image was built from: `stdlib` for
+      # the baked-in path, and the `aminicoro` submodule for minicoro.h.
+      - uses: actions/checkout@v4
+        with:
+          repository: lichtblau/ante
+          ref: ${{ env.ANTE_COMMIT }}
+          submodules: true
+          path: ante-compiler
+
+      - name: Install libuv
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libuv1-dev
+
+      - name: Extract ante and minicoro.o from the compiler image
+        run: |
+          image="ghcr.io/lichtblau/ante:static-musl-$ANTE_COMMIT"
+          docker pull -q "$image"
+          cid="$(docker create "$image")"
+          mkdir -p ante-compiler/target/release
+          docker cp "$cid:/ante" ante-compiler/target/release/ante
+          docker cp "$cid:/minicoro.o" "$RUNNER_TEMP/minicoro.o"
+          docker rm "$cid"
+          ante-compiler/target/release/ante --version
+          # lib.sh takes the compiler from PATH (`command -v ante`), and resolves aminicoro/
+          # relative to it -- see the header comment.
+          echo "$GITHUB_WORKSPACE/ante-compiler/target/release" >> "$GITHUB_PATH"
+
+      - name: Materialize the compiler's baked-in paths
+        run: |
+          sudo cp "$RUNNER_TEMP/minicoro.o" /minicoro.o
+          mkdir -p /home/runner/work/ante/ante
+          cp -r ante-compiler/stdlib /home/runner/work/ante/ante/stdlib
+
+      # Builds the C shim and the suite at the default optimization level and at -O3, and runs
+      # both. (`./tests/uv/run.sh asan` is a third lane, left out here for time.)
+      - name: Build and run the uv test suite
+        run: ./tests/uv/run.sh
+
+      # The examples are one ante project, so building any one of them compiles them all; this
+      # is their compile check, with the one example that needs neither a peer nor a clock
+      # actually run.
+      - name: Build the examples
+        run: ./examples/run.sh sys-info
