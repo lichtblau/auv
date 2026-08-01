@@ -1,0 +1,759 @@
+// Scheduler suite: everything a task can do besides sleep -- joining, being cancelled,
+// waking on a descriptor or a signal, losing a race, and being torn down.
+
+import Local.Harness.TestState, ok, is_i32, is_i64, is_usz
+import Local.Uv.Uv.Loop, copy_loop, Slot, copy_slot, Completion, copy_completion,
+    uv_err_name_of, uv_err_msg_of,
+    as_i64, as_u64, k_poll,
+    slot_rearm, slot_deliver, slot_new, slot_state, slot_completion, st_empty, st_done,
+    handle_adopt_slot, handle_slot, loop_run_once, loop_run_nowait,
+    k_timer, k_poll, k_signal, k_prepare, k_check, k_idle,
+    k_cancelled, k_joined, k_closed, k_none, handle_null, handle_is_null, handle_set_slot,
+    close_handle, close_handle_waking, timer_new, timer_start, timer_stop,
+    poll_new, poll_start, poll_stop, uv_readable, k_user, k_exit,
+    signal_new, signal_start, signal_stop, sigusr1, getpid, kill_pid,
+    prepare_new, prepare_start, prepare_stop, check_new, check_start, check_stop,
+    idle_new, idle_start, idle_stop,
+    buf_alloc, buf_free, i32_at, pipe_fds, fd_write_string, fd_close,
+    uv_check, uv_error_of, UvError, loop_thread_faults
+import Local.Uv.Task.Runtime, rt_new, rt_free, rt_loop, rt_live_count, rt_task_count,
+    spawn, spawn_default, park, join, cancel, wake, abandon, run, step, step_nowait, run_ready,
+    has_ready, shutdown, current_slot, current_id, set_result, sleep_ms, task_sleep, ts_reaped,
+    task_wait_writable,
+    task_state
+import Std.Vec.Vec, empty, push, len
+import Std.C.malloc, free
+import Std.String.eq_string
+
+export run_sched_tests
+
+// --- shared shapes ---------------------------------------------------------------------------
+
+type Arg =
+    rt: Ptr Runtime
+    log: Ptr (Vec I64)
+    a: I64
+    b: I64
+
+impl copy_sarg: Copy Arg with (.*) = deref
+
+arg_of (p: Ptr U8): Arg = deref_ptr (transmute p : Ptr Arg)
+
+log_push (a: Arg) (v: I64): Unit =
+    lg = ptr_to_mut a.log
+    lg.push v
+
+new_log (): Ptr (Vec I64) =
+    p: Ptr (Vec I64) = malloc (size_of (MkType : Type (Vec I64)))
+    ptr_store p (Vec.empty ())
+    p
+
+new_args (n: Usz): Ptr Arg = malloc (n * size_of (MkType : Type Arg))
+arg_slot (base: Ptr Arg) (i: Usz): Ptr Arg = offset base i
+
+log_at (p: Ptr (Vec I64)) (i: Usz): I64 =
+    lg = ptr_to_mut p
+    if i >= lg.len then -1 else deref_ptr (offset lg.data i)
+
+log_len (p: Ptr (Vec I64)): Usz = (ptr_to_mut p).len
+
+log_sum (p: Ptr (Vec I64)): I64 =
+    lg = ptr_to_mut p
+    var s = 0
+    var i = 0usz
+    while i < lg.len do
+        s := s + deref_ptr (offset lg.data i)
+        i := i + 1usz
+    s
+
+log_count (p: Ptr (Vec I64)) (v: I64): Usz =
+    lg = ptr_to_mut p
+    var n = 0usz
+    var i = 0usz
+    while i < lg.len do
+        if deref_ptr (offset lg.data i) == v then n := n + 1usz
+        i := i + 1usz
+    n
+
+free_log (p: Ptr (Vec I64)): Unit =
+    lg = ptr_to_mut p
+    if not (handle_is_null (transmute lg.data)) then free (transmute lg.data)
+    free (transmute p)
+
+teardown (t: mut TestState) (label: String) (rtp: Ptr Runtime): Unit =
+    t.is_i64 (clone label ++ ": no completion arrived off the loop thread")
+             (loop_thread_faults (rt_loop rtp)) 0
+    shutdown rtp
+    t.is_usz (label ++ ": shutdown emptied the task table") (rt_task_count rtp) 0usz
+    rt_free rtp
+
+// --- parking until a descriptor is writable ---------------------------------------------------
+// `task_wait_writable` is what a nonblocking connect waits on. A pipe exercises both of its answers
+// hermetically: a fresh write end is writable at once, and a FULL one is not writable until
+// somebody reads, so a short deadline expires on it. No sockets, no network, no timing assumptions
+// beyond "50 ms is longer than zero".
+
+c_pipe   = extern "pipe":   fn (Ptr U8) -> I32
+c_write  = extern "write":  fn I32 (Ptr U8) Usz -> I64
+c_close  = extern "close":  fn I32 -> I32
+c_fcntl  = extern "fcntl":  fn I32 I32 I32 -> I32
+
+f_setfl (): I32 = 4
+o_nonblock (): I32 = 2048       // 0o4000 on Linux
+
+// (read_fd, write_fd) as two I32s in a malloc'd pair.
+pipe_pair (): Ptr I32 =
+    p: Ptr I32 = malloc 8usz
+    ignore (c_pipe (transmute p))
+    p
+
+pipe_read_fd (p: Ptr I32): I32 = deref_ptr p
+pipe_write_fd (p: Ptr I32): I32 = deref_ptr (offset p 1usz)
+
+// Fill the pipe until the kernel refuses more, so the write end stops being writable.
+fill_pipe (fd: I32): Unit =
+    ignore (c_fcntl fd (f_setfl ()) (o_nonblock ()))
+    buf: Ptr U8 = malloc 4096usz
+    var going = true
+    var guard = 0
+    while going and guard < 1024 do
+        if c_write fd buf 4096usz < 0 then going := false
+        guard := guard + 1
+    free buf
+
+// arg.a holds the descriptor, arg.b the deadline; logs the completion kind.
+writable_waiter (p: Ptr U8): Unit =
+    arg = arg_of p
+    c = task_wait_writable arg.rt (I32 arg.a) arg.b
+    log_push arg (I64 c.kind)
+
+test_wait_writable (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    args = new_args 2usz
+
+    // 1. an empty pipe: the write end is writable, so the poll wins the race against the deadline.
+    open_p = pipe_pair ()
+    ptr_store (arg_slot args 0usz) (Arg rtp lg (I64 (pipe_write_fd open_p)) 5000)
+    ignore (spawn_default rtp (transmute (writable_waiter : fn (Ptr U8) -> Unit))
+                              (transmute (arg_slot args 0usz)))
+    run rtp
+    t.is_i64 "wait_writable: an empty pipe is writable" (log_at lg 0usz) (I64 (k_poll ()))
+
+    // 2. a full pipe: nobody is reading, so the deadline is what ends the wait.
+    full_p = pipe_pair ()
+    fill_pipe (pipe_write_fd full_p)
+    ptr_store (arg_slot args 1usz) (Arg rtp lg (I64 (pipe_write_fd full_p)) 50)
+    ignore (spawn_default rtp (transmute (writable_waiter : fn (Ptr U8) -> Unit))
+                              (transmute (arg_slot args 1usz)))
+    run rtp
+    t.is_i64 "wait_writable: a full pipe times out instead" (log_at lg 1usz) (I64 (k_timer ()))
+    t.is_i64 "wait_writable: no completion off the loop thread" (loop_thread_faults (rt_loop rtp)) 0
+
+    teardown t "wait_writable" rtp
+    ignore (c_close (pipe_read_fd open_p))
+    ignore (c_close (pipe_write_fd open_p))
+    ignore (c_close (pipe_read_fd full_p))
+    ignore (c_close (pipe_write_fd full_p))
+    free (transmute open_p)
+    free (transmute full_p)
+    free_log lg
+    free (transmute args)
+
+// --- a result outlives the row's retirement ---------------------------------------------------
+
+// The storm below covers this, but only when the scheduling happens to go the wrong way -- which is
+// how it stayed broken: at the lane's default optimization the 500 children all finish in one turn
+// and get joined before anything is reaped, and only at -O3 (the level the editor ships) is
+// spawning fast enough for them to finish in staggered batches with a `reap` in between. This one
+// is deterministic: the child is finished before the joiner has even started, so its row is
+// certainly retired by the time the join happens.
+retired_child (p: Ptr U8): Unit =
+    arg = arg_of p
+    set_result arg.rt (I32 arg.a)
+
+late_joiner (p: Ptr U8): Unit =
+    arg = arg_of p
+    // Hand the loop back so `run` gets its turn to reap, then ask for the result anyway.
+    ignore (sleep_ms arg.rt 30)
+    log_push arg (I64 (join arg.rt (as_u64 arg.b)))
+
+test_join_after_reap (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    args = new_args 2usz
+    ptr_store (arg_slot args 0usz) (Arg rtp lg 7 0)
+    // `spawn` runs it right here: it neither parks nor prompts, so it is DONE before this returns.
+    kid = spawn_default rtp (transmute (retired_child : fn (Ptr U8) -> Unit))
+                            (transmute (arg_slot args 0usz))
+    ptr_store (arg_slot args 1usz) (Arg rtp lg 0 (as_i64 kid))
+    ignore (spawn_default rtp (transmute (late_joiner : fn (Ptr U8) -> Unit))
+                              (transmute (arg_slot args 1usz)))
+    run rtp
+
+    t.is_usz "join_after_reap: the joiner ran" (log_len lg) 1usz
+    t.is_i64 "join_after_reap: a finished task's result survives its row being reaped"
+             (log_at lg 0usz) 7
+    teardown t "join_after_reap" rtp
+    free_log lg
+    free (transmute args)
+
+// --- spawn storm -----------------------------------------------------------------------------
+
+// Sleep `a` ms, report `a` as this task's result, and record it.
+storm_child (p: Ptr U8): Unit =
+    arg = arg_of p
+    ignore (sleep_ms arg.rt arg.a)
+    set_result arg.rt (I32 arg.a)
+    log_push arg arg.a
+
+// Spawn the whole fleet, then join every one of them in spawn order.
+storm_root (p: Ptr U8): Unit =
+    arg = arg_of p
+    n = Usz arg.a
+    kids = new_args n
+    var ids: Vec U64 = Vec.empty ()
+    var i = 0usz
+    while i < n do
+        // 1..20 ms, cycling, so the wake order is nothing like the spawn order.
+        ptr_store (arg_slot kids i) (Arg arg.rt arg.log (I64 (i % 20usz) + 1) 0)
+        // A small stack on purpose: five hundred of them are alive at once, and these
+        // bodies do nothing but sleep and record.
+        ids.push (spawn arg.rt (transmute (storm_child : fn (Ptr U8) -> Unit))
+                               (transmute (arg_slot kids i)) 65536usz)
+        i := i + 1usz
+    var joined = 0
+    i := 0usz
+    while i < n do
+        id = deref_ptr (offset ids.data i)
+        joined := joined + I64 (join arg.rt id)
+        i := i + 1usz
+    log_push arg joined
+    free (transmute kids)
+    if not (handle_is_null (transmute ids.data)) then free (transmute ids.data)
+
+test_spawn_storm (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    n = 500usz
+    args = new_args 1usz
+    ptr_store (arg_slot args 0usz) (Arg rtp lg (I64 n) 0)
+    ignore (spawn_default rtp (transmute (storm_root : fn (Ptr U8) -> Unit))
+                              (transmute (arg_slot args 0usz)))
+    run rtp
+
+    // n child entries plus the root's total.
+    t.is_usz "spawn_storm: every child ran" (log_len lg) (n + 1usz)
+    // Each child logs its own duration and reports it as its result, so the root's sum of
+    // join results must equal the sum of everything the children logged.
+    joined = log_at lg n
+    t.is_i64 "spawn_storm: join returned every child's result" (log_sum lg) (joined * 2)
+    t.is_usz "spawn_storm: everything reaped" (rt_live_count rtp) 0usz
+    teardown t "spawn_storm" rtp
+    free_log lg
+    free (transmute args)
+
+// --- cancel storm ----------------------------------------------------------------------------
+
+// Sleep for a good long while, and record whether the sleep finished or was cancelled.
+cancel_child (p: Ptr U8): Unit =
+    arg = arg_of p
+    c = task_sleep arg.rt arg.a
+    log_push arg (I64 c.kind)
+
+cancel_root (p: Ptr U8): Unit =
+    arg = arg_of p
+    n = Usz arg.a
+    kids = new_args n
+    var ids: Vec U64 = Vec.empty ()
+    var i = 0usz
+    while i < n do
+        ptr_store (arg_slot kids i) (Arg arg.rt arg.log 5000 0)
+        ids.push (spawn_default arg.rt (transmute (cancel_child : fn (Ptr U8) -> Unit))
+                                       (transmute (arg_slot kids i)))
+        i := i + 1usz
+    // Let them all get parked, then cancel every other one.
+    ignore (sleep_ms arg.rt 50)
+    i := 0usz
+    while i < n do
+        if i % 2usz == 0usz then cancel arg.rt (deref_ptr (offset ids.data i))
+        i := i + 1usz
+    // The survivors would sleep for five seconds; cancel them too rather than wait.
+    ignore (sleep_ms arg.rt 50)
+    i := 0usz
+    while i < n do
+        cancel arg.rt (deref_ptr (offset ids.data i))
+        i := i + 1usz
+    i := 0usz
+    while i < n do
+        ignore (join arg.rt (deref_ptr (offset ids.data i)))
+        i := i + 1usz
+    free (transmute kids)
+    if not (handle_is_null (transmute ids.data)) then free (transmute ids.data)
+
+test_cancel_storm (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    n = 100usz
+    args = new_args 1usz
+    ptr_store (arg_slot args 0usz) (Arg rtp lg (I64 n) 0)
+    ignore (spawn_default rtp (transmute (cancel_root : fn (Ptr U8) -> Unit))
+                              (transmute (arg_slot args 0usz)))
+    run rtp
+
+    t.is_usz "cancel_storm: every child returned" (log_len lg) n
+    t.is_usz "cancel_storm: all of them by cancellation" (log_count lg (I64 (k_cancelled ()))) n
+    t.is_usz "cancel_storm: everything reaped" (rt_live_count rtp) 0usz
+    teardown t "cancel_storm" rtp
+    free_log lg
+    free (transmute args)
+
+// --- close while parked ------------------------------------------------------------------------
+
+// Park on a pipe that nobody writes to. `b` carries the read fd; a sibling task closes the
+// poll handle out from under this one.
+closee (p: Ptr U8): Unit =
+    arg = arg_of p
+    slot = current_slot arg.rt
+    h = poll_new (rt_loop arg.rt) (I32 arg.b)
+    handle_set_slot h slot
+    slot_rearm slot
+    ignore (poll_start h (uv_readable ()))
+    // Hand the handle to the closer through the log, which is the only shared cell here.
+    log_push arg (transmute h : I64)
+    c = park arg.rt
+    log_push arg (I64 c.kind)
+
+closer (p: Ptr U8): Unit =
+    arg = arg_of p
+    ignore (sleep_ms arg.rt 50)
+    h: Ptr U8 = transmute (log_at arg.log 0usz)
+    close_handle_waking h (k_closed ()) 0
+
+test_close_while_parked (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    fds = buf_alloc 8usz
+    t.is_i32 "close_while_parked: pipe created" (pipe_fds fds) 0
+    rfd = i32_at fds 0usz
+    wfd = i32_at fds 1usz
+    args = new_args 2usz
+    ptr_store (arg_slot args 0usz) (Arg rtp lg 0 (I64 rfd))
+    ptr_store (arg_slot args 1usz) (Arg rtp lg 0 0)
+    ignore (spawn_default rtp (transmute (closee : fn (Ptr U8) -> Unit))
+                              (transmute (arg_slot args 0usz)))
+    ignore (spawn_default rtp (transmute (closer : fn (Ptr U8) -> Unit))
+                              (transmute (arg_slot args 1usz)))
+    run rtp
+
+    t.is_usz "close_while_parked: the parked task woke" (log_len lg) 2usz
+    t.is_i64 "close_while_parked: it woke with the close completion"
+             (log_at lg 1usz) (I64 (k_closed ()))
+    teardown t "close_while_parked" rtp
+    ignore (fd_close rfd)
+    ignore (fd_close wfd)
+    buf_free fds
+    free_log lg
+    free (transmute args)
+
+// --- poll actually polls -------------------------------------------------------------------------
+
+poller (p: Ptr U8): Unit =
+    arg = arg_of p
+    slot = current_slot arg.rt
+    h = poll_new (rt_loop arg.rt) (I32 arg.b)
+    handle_set_slot h slot
+    slot_rearm slot
+    ignore (poll_start h (uv_readable ()))
+    c = park arg.rt
+    ignore (poll_stop h)
+    close_handle h
+    log_push arg (I64 c.kind)
+
+writer (p: Ptr U8): Unit =
+    arg = arg_of p
+    ignore (sleep_ms arg.rt 50)
+    ignore (fd_write_string (I32 arg.b) "x")
+
+test_poll (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    fds = buf_alloc 8usz
+    ignore (pipe_fds fds)
+    rfd = i32_at fds 0usz
+    wfd = i32_at fds 1usz
+    args = new_args 2usz
+    ptr_store (arg_slot args 0usz) (Arg rtp lg 0 (I64 rfd))
+    ptr_store (arg_slot args 1usz) (Arg rtp lg 0 (I64 wfd))
+    ignore (spawn_default rtp (transmute (poller : fn (Ptr U8) -> Unit))
+                              (transmute (arg_slot args 0usz)))
+    ignore (spawn_default rtp (transmute (writer : fn (Ptr U8) -> Unit))
+                              (transmute (arg_slot args 1usz)))
+    run rtp
+
+    t.is_usz "poll: the reader woke" (log_len lg) 1usz
+    t.is_i64 "poll: with a poll completion" (log_at lg 0usz) (I64 (k_poll ()))
+    teardown t "poll" rtp
+    ignore (fd_close rfd)
+    ignore (fd_close wfd)
+    buf_free fds
+    free_log lg
+    free (transmute args)
+
+// --- the timeout race ------------------------------------------------------------------------------
+
+// Park on a pipe nobody writes to, with a timer racing it into the same wait slot. Exactly
+// one of the two wins the latch; the loser's completion is dropped and its handle is closed
+// by the winner's continuation.
+racer (p: Ptr U8): Unit =
+    arg = arg_of p
+    slot = current_slot arg.rt
+    hp = poll_new (rt_loop arg.rt) (I32 arg.b)
+    ht = timer_new (rt_loop arg.rt)
+    handle_set_slot hp slot
+    handle_set_slot ht slot
+    slot_rearm slot
+    ignore (poll_start hp (uv_readable ()))
+    ignore (timer_start ht arg.a 0)
+    c = park arg.rt
+    ignore (poll_stop hp)
+    ignore (timer_stop ht)
+    close_handle hp
+    close_handle ht
+    log_push arg (I64 c.kind)
+
+test_timeout_race (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    fds = buf_alloc 8usz
+    ignore (pipe_fds fds)
+    rfd = i32_at fds 0usz
+    wfd = i32_at fds 1usz
+    args = new_args 1usz
+    ptr_store (arg_slot args 0usz) (Arg rtp lg 50 (I64 rfd))
+    ignore (spawn_default rtp (transmute (racer : fn (Ptr U8) -> Unit))
+                              (transmute (arg_slot args 0usz)))
+    run rtp
+
+    t.is_usz "timeout_race: the task woke exactly once" (log_len lg) 1usz
+    t.is_i64 "timeout_race: the timer won" (log_at lg 0usz) (I64 (k_timer ()))
+    teardown t "timeout_race" rtp
+    ignore (fd_close rfd)
+    ignore (fd_close wfd)
+    buf_free fds
+    free_log lg
+    free (transmute args)
+
+// --- signals ----------------------------------------------------------------------------------------
+
+signaller (p: Ptr U8): Unit =
+    arg = arg_of p
+    slot = current_slot arg.rt
+    h = signal_new (rt_loop arg.rt)
+    handle_set_slot h slot
+    slot_rearm slot
+    ignore (signal_start h (sigusr1 ()))
+    // The signal has to arrive after the loop is watching for it, which is what the sibling
+    // task's sleep guarantees.
+    c = park arg.rt
+    ignore (signal_stop h)
+    close_handle h
+    log_push arg (I64 c.kind)
+    log_push arg c.status
+
+raiser (p: Ptr U8): Unit =
+    arg = arg_of p
+    ignore (sleep_ms arg.rt 50)
+    ignore (kill_pid (getpid ()) (sigusr1 ()))
+
+test_signal (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    args = new_args 2usz
+    ptr_store (arg_slot args 0usz) (Arg rtp lg 0 0)
+    ptr_store (arg_slot args 1usz) (Arg rtp lg 0 0)
+    ignore (spawn_default rtp (transmute (signaller : fn (Ptr U8) -> Unit))
+                              (transmute (arg_slot args 0usz)))
+    ignore (spawn_default rtp (transmute (raiser : fn (Ptr U8) -> Unit))
+                              (transmute (arg_slot args 1usz)))
+    run rtp
+
+    t.is_usz "signal: the watcher woke" (log_len lg) 2usz
+    t.is_i64 "signal: with a signal completion" (log_at lg 0usz) (I64 (k_signal ()))
+    t.is_i64 "signal: carrying the signal number" (log_at lg 1usz) (I64 (sigusr1 ()))
+    teardown t "signal" rtp
+    free_log lg
+    free (transmute args)
+
+// --- prepare / check / idle -------------------------------------------------------------------------
+
+// One loop turn fires prepare before the poll phase and check after it; idle runs in the
+// same phase as prepare but keeps the loop from ever blocking. Parking on each in turn is
+// enough to prove all three trampolines are wired.
+phaser (p: Ptr U8): Unit =
+    arg = arg_of p
+    slot = current_slot arg.rt
+    lp = rt_loop arg.rt
+
+    hp = prepare_new lp
+    handle_set_slot hp slot
+    slot_rearm slot
+    ignore (prepare_start hp)
+    cp = park arg.rt
+    ignore (prepare_stop hp)
+    close_handle hp
+    log_push arg (I64 cp.kind)
+
+    hc = check_new lp
+    handle_set_slot hc slot
+    slot_rearm slot
+    ignore (check_start hc)
+    cc = park arg.rt
+    ignore (check_stop hc)
+    close_handle hc
+    log_push arg (I64 cc.kind)
+
+    hi = idle_new lp
+    handle_set_slot hi slot
+    slot_rearm slot
+    ignore (idle_start hi)
+    ci = park arg.rt
+    ignore (idle_stop hi)
+    close_handle hi
+    log_push arg (I64 ci.kind)
+
+test_phases (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    args = new_args 1usz
+    ptr_store (arg_slot args 0usz) (Arg rtp lg 0 0)
+    ignore (spawn_default rtp (transmute (phaser : fn (Ptr U8) -> Unit))
+                              (transmute (arg_slot args 0usz)))
+    run rtp
+
+    t.is_usz "phases: prepare, check and idle all fired" (log_len lg) 3usz
+    t.is_i64 "phases: prepare" (log_at lg 0usz) (I64 (k_prepare ()))
+    t.is_i64 "phases: check" (log_at lg 1usz) (I64 (k_check ()))
+    t.is_i64 "phases: idle" (log_at lg 2usz) (I64 (k_idle ()))
+    teardown t "phases" rtp
+    free_log lg
+    free (transmute args)
+
+// --- shutdown reaps everything ------------------------------------------------------------------------
+
+// Sleep far longer than the test is willing to wait; shutdown is what ends this.
+sleeper_forever (p: Ptr U8): Unit =
+    arg = arg_of p
+    c = task_sleep arg.rt 60000
+    log_push arg (I64 c.kind)
+
+test_shutdown_reaps (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    n = 8usz
+    args = new_args n
+    var i = 0usz
+    while i < n do
+        ptr_store (arg_slot args i) (Arg rtp lg 0 0)
+        ignore (spawn_default rtp (transmute (sleeper_forever : fn (Ptr U8) -> Unit))
+                                  (transmute (arg_slot args i)))
+        i := i + 1usz
+    // No `run` at all: every task is parked on a minute-long timer right now.
+    t.is_usz "shutdown_reaps: all tasks parked" (rt_live_count rtp) n
+    shutdown rtp
+    t.is_usz "shutdown_reaps: every task returned" (log_len lg) n
+    t.is_usz "shutdown_reaps: all of them cancelled" (log_count lg (I64 (k_cancelled ()))) n
+    t.is_usz "shutdown_reaps: task table empty" (rt_task_count rtp) 0usz
+    rt_free rtp
+    free_log lg
+    free (transmute args)
+
+// --- an embedder's own loop -----------------------------------------------------------------------------
+
+// `run` owns the outer loop and stops when the tasks do, which is exactly what a program whose
+// loop outlives every task in it cannot use. `step` is that loop's one turn -- drain the ready
+// queue, reap, wait -- and `step_nowait` the same turn for a caller that still owes work of its
+// own and must not block. The editor's event loop is built on the pair.
+
+step_sleeper (p: Ptr U8): Unit =
+    arg = arg_of p
+    ignore (sleep_ms arg.rt arg.a)
+    log_push arg arg.a
+
+test_step (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    args = new_args 2usz
+    ptr_store (arg_slot args 0usz) (Arg rtp lg 50 0)
+    ptr_store (arg_slot args 1usz) (Arg rtp lg 150 0)
+    ignore (spawn_default rtp (transmute (step_sleeper : fn (Ptr U8) -> Unit))
+                              (transmute (arg_slot args 0usz)))
+    ignore (spawn_default rtp (transmute (step_sleeper : fn (Ptr U8) -> Unit))
+                              (transmute (arg_slot args 1usz)))
+    // A non-blocking turn services what is ready and comes straight back; both timers are
+    // still running, so it must return having finished nothing.
+    step_nowait rtp
+    t.is_usz "step: a nowait turn does not wait for the timers" (log_len lg) 0usz
+    t.is_usz "step: both tasks still live" (rt_live_count rtp) 2usz
+    var turns = 0
+    while log_len lg < 2usz and turns < 64 do
+        step rtp
+        turns := turns + 1
+    t.is_usz "step: the caller's own loop ran both tasks to completion" (log_len lg) 2usz
+    t.is_i64 "step: in timer order" (log_at lg 0usz) 50
+    // Reaping happens at the top of a turn, so the tasks that finished during the last one are
+    // still on the table until one more turn goes by.
+    step_nowait rtp
+    t.is_usz "step: finished tasks were reaped" (rt_live_count rtp) 0usz
+    teardown t "step" rtp
+    free_log lg
+    free (transmute args)
+
+// --- a repeating timer, scanned rather than parked on ---------------------------------------------------
+
+// `timer_start`'s second argument makes the timer REPEAT, and nothing in this suite used it until
+// the editor's raylib backend needed a frame clock: a window has no descriptor to be woken by, so a
+// repeating timer is what brings its wait back to pump the window.
+// The shape is the host's, not a task's -- a handle owning its own slot, latched by the trampoline
+// and SCANNED after each turn -- so this drives the loop directly and never parks.
+test_repeating_timer (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lp = rt_loop rtp
+    ht = timer_new lp
+    handle_adopt_slot ht (slot_new ())
+    s = handle_slot ht
+    // 20 ms, repeating every 20 ms.
+    t.is_i32 "repeat: the timer started" (timer_start ht 20 20) 0i32
+
+    var fired = 0
+    var turns = 0
+    while fired < 3 and turns < 200 do
+        ignore (loop_run_once lp)
+        if slot_state s == st_done () then
+            ignore (slot_completion s)
+            slot_rearm s
+            fired := fired + 1
+        turns := turns + 1
+    t.is_i32 "repeat: one arming fires again and again" fired 3
+    // And stopping it means stopping it: a nonblocking turn with nothing else armed finds nothing.
+    t.is_i32 "repeat: the timer stopped" (timer_stop ht) 0i32
+    ignore (loop_run_nowait lp)
+    t.is_i32 "repeat: nothing fires after the stop" (slot_state s) (st_empty ())
+    close_handle ht
+    teardown t "repeat" rtp
+
+// --- waking, abandoning, and not growing forever ------------------------------------------------------
+
+// A task parked on nothing in particular: only an outside `wake` can ever move it. This is the
+// shape every editor prompt has -- the answer comes from a keystroke, not from libuv.
+waiter_task (p: Ptr U8): Unit =
+    arg = arg_of p
+    c = park arg.rt
+    log_push arg (I64 c.kind)
+    log_push arg c.status
+
+test_wake (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    args = new_args 1usz
+    ptr_store (arg_slot args 0usz) (Arg rtp lg 0 0)
+    id = spawn_default rtp (transmute (waiter_task : fn (Ptr U8) -> Unit))
+                           (transmute (arg_slot args 0usz))
+    t.is_usz "wake: the task parked and is waiting on nobody" (log_len lg) 0usz
+    t.ok "wake: nothing is queued before it" (not (has_ready rtp))
+    // The wake is DEFERRED: it latches and queues, and the continuation runs only when the
+    // scheduler drains. That is what keeps a waker's frame off the woken task's stack.
+    wake rtp id (k_user ()) 77
+    t.is_usz "wake: still parked until the queue is drained" (log_len lg) 0usz
+    // ...and the embedder can SEE that it owes a drain, which is how it knows a repaint is coming.
+    t.ok "wake: the queue now says there is something to resume" (has_ready rtp)
+    run_ready rtp
+    t.is_usz "wake: the continuation ran on the drain" (log_len lg) 2usz
+    t.ok "wake: and the queue is empty again" (not (has_ready rtp))
+    t.is_i64 "wake: carrying the caller's kind" (log_at lg 0usz) (I64 (k_user ()))
+    t.is_i64 "wake: and its status" (log_at lg 1usz) 77
+    t.is_usz "wake: and the task was reaped by the same drain" (rt_live_count rtp) 0usz
+    teardown t "wake" rtp
+    free_log lg
+    free (transmute args)
+
+test_abandon (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    args = new_args 1usz
+    ptr_store (arg_slot args 0usz) (Arg rtp lg 0 0)
+    id = spawn_default rtp (transmute (waiter_task : fn (Ptr U8) -> Unit))
+                           (transmute (arg_slot args 0usz))
+    t.is_usz "abandon: one task parked" (rt_live_count rtp) 1usz
+    abandon rtp id
+    // The difference from `cancel`, and the whole reason it exists: the continuation NEVER runs.
+    t.is_usz "abandon: the continuation did not run" (log_len lg) 0usz
+    t.is_usz "abandon: and the task is gone" (rt_live_count rtp) 0usz
+    run_ready rtp
+    t.is_usz "abandon: still not run after a drain" (log_len lg) 0usz
+    teardown t "abandon" rtp
+    free_log lg
+    free (transmute args)
+
+// A program that spawns a task per unit of work -- an editor spawns one per keystroke -- must not
+// leave a row behind for each. Nothing here refers to a task by index, so a reaped row is dropped.
+noop_task (p: Ptr U8): Unit =
+    arg = arg_of p
+    log_push arg arg.a
+
+test_table_does_not_grow (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    args = new_args 1usz
+    ptr_store (arg_slot args 0usz) (Arg rtp lg 1 0)
+    var i = 0usz
+    while i < 200usz do
+        ignore (spawn_default rtp (transmute (noop_task : fn (Ptr U8) -> Unit))
+                                  (transmute (arg_slot args 0usz)))
+        run_ready rtp
+        i := i + 1usz
+    t.is_usz "table: every task ran" (log_len lg) 200usz
+    t.is_usz "table: and not one row survived them" (rt_task_count rtp) 0usz
+    teardown t "table" rtp
+    free_log lg
+    free (transmute args)
+
+// --- the embedder's completion-kind base --------------------------------------------------------------
+
+test_user_kinds (t: mut TestState): Unit =
+    t.is_i32 "k_user: is the documented base" (k_user ()) 100
+    t.ok "k_user: leaves room above every kind the binding defines" (k_user () > k_exit ())
+
+// --- errors are values ---------------------------------------------------------------------------------
+
+test_uv_error (t: mut TestState): Unit =
+    // UV_EINVAL is -22 on every platform libuv supports.
+    match uv_check -22
+    | Ok _ -> t.ok "uv_check: a negative status is an error" false
+    | Error e ->
+        t.ok "uv_check: a negative status is an error" true
+        t.is_i32 "uv_check: keeps the code" e.code -22
+        t.ok "uv_check: names the error" (uv_err_name_of e.code == "EINVAL")
+        t.ok "uv_check: describes the error" ((uv_err_msg_of e.code).length > 0)
+    match uv_check 0
+    | Ok _ -> t.ok "uv_check: zero is success" true
+    | Error _e -> t.ok "uv_check: zero is success" false
+
+run_sched_tests (t: mut TestState): Unit =
+    test_uv_error t
+    test_user_kinds t
+    test_step t
+    test_wake t
+    test_abandon t
+    test_table_does_not_grow t
+    test_phases t
+    test_repeating_timer t
+    test_poll t
+    test_timeout_race t
+    test_close_while_parked t
+    test_signal t
+    test_shutdown_reaps t
+    test_cancel_storm t
+    test_wait_writable t
+    test_join_after_reap t
+    test_spawn_storm t

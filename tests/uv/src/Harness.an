@@ -1,0 +1,59 @@
+// A tiny test harness: thread a `mut TestState` through the test functions,
+// which record pass/fail counts and print each failure.
+
+export TestState, new_state, ok, is_i32, is_i64, is_usz, report, failed_count
+
+type TestState =
+    passed: I32
+    failed: I32
+
+new_state (): TestState = TestState 0 0
+
+TestState.ok (t: mut TestState) (label: String) (cond: Bool): Unit =
+    if cond then
+        t.passed := t.passed + 1
+    else
+        t.failed := t.failed + 1
+        print "FAIL: "
+        println label
+
+TestState.is_i32 (t: mut TestState) (label: String) (got: I32) (want: I32): Unit =
+    if got == want then t.passed := t.passed + 1
+    else
+        t.failed := t.failed + 1
+        print "FAIL: "
+        print label
+        print "  got "
+        print got
+        print " want "
+        println want
+
+TestState.is_i64 (t: mut TestState) (label: String) (got: I64) (want: I64): Unit =
+    if got == want then t.passed := t.passed + 1
+    else
+        t.failed := t.failed + 1
+        print "FAIL: "
+        print label
+        print "  got "
+        print got
+        print " want "
+        println want
+
+TestState.is_usz (t: mut TestState) (label: String) (got: Usz) (want: Usz): Unit =
+    if got == want then t.passed := t.passed + 1
+    else
+        t.failed := t.failed + 1
+        print "FAIL: "
+        print label
+        print "  got "
+        print got
+        print " want "
+        println want
+
+TestState.report (t: ref TestState): Unit =
+    print "passed: "
+    print t.passed
+    print "   failed: "
+    println t.failed
+
+TestState.failed_count (t: ref TestState): I32 = t.failed

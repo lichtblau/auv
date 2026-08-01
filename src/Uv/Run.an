@@ -1,0 +1,91 @@
+// Getting a program onto the loop, for a program whose whole structure is the loop.
+//
+// `Task.spawn` takes a C-shaped entry pointer plus one opaque argument, and `run_uv` has to be
+// installed on the new task's own stack. Both are right for an embedder -- one that already
+// owns a loop, drives it with `step`, and hands tasks context of its own shape. They are the
+// wrong first thing to write for a program that just wants to be async, so the casts and the
+// heap cell live here instead of at the top of every such program. What is left is an
+// ordinary function over the `Async` effect and a `main` of one line:
+//
+//     talk (rtp: Ptr Runtime) (id: I64): Unit can Async = ...
+//     main () = run_async talk_to_everyone
+//
+// This module is a convenience, not a layer: it uses nothing the caller could not, and a
+// program that outgrows it drops to `spawn`/`run_uv` for the tasks that need more.
+//
+// WHY A TYPE PER PAYLOAD rather than one generic pair. A closure cannot carry the body: an
+// Ante closure is not storable across the coroutine boundary, and the compiler's MIR
+// validator rejects the program that tries. Nor can the payload be generic: a generic
+// trampoline still has to reach `spawn` as a monomorphic `fn (Ptr U8) -> Unit`, and a
+// function value carrying a `Copy a` constraint is not a bare function pointer -- casting one
+// to that signature compiles and then segfaults. An effectful function POINTER does survive
+// the round trip, which is what these three are built on.
+
+import Local.Uv.Task.Runtime, rt_new, rt_free, spawn_default, run, shutdown
+import Local.Uv.Async.Async, run_uv
+import Local.Uv.Stream.Stream, copy_stream
+import Std.C.malloc, free
+
+export run_async, spawn_async, spawn_stream
+
+type Job =
+    rt: Ptr Runtime
+    body: Ptr U8
+
+type JobI64 =
+    rt: Ptr Runtime
+    body: Ptr U8
+    arg: I64
+
+type JobStream =
+    rt: Ptr Runtime
+    body: Ptr U8
+    arg: Stream
+
+impl copy_job: Copy Job with (.*) = deref
+impl copy_job_i64: Copy JobI64 with (.*) = deref
+impl copy_job_stream: Copy JobStream with (.*) = deref
+
+// Each trampoline recovers its job and installs the `Async` handler. That has to happen on
+// the task's own stack, and this is it: `run_uv` is legal here and nowhere else.
+job_entry (p: Ptr U8): Unit =
+    j = deref_ptr (transmute p : Ptr Job)
+    body: fn (Ptr Runtime) -> Unit can Async = transmute j.body
+    run_uv j.rt fn () -> body j.rt
+    free p
+
+job_entry_i64 (p: Ptr U8): Unit =
+    j = deref_ptr (transmute p : Ptr JobI64)
+    body: fn (Ptr Runtime) I64 -> Unit can Async = transmute j.body
+    run_uv j.rt fn () -> body j.rt j.arg
+    free p
+
+job_entry_stream (p: Ptr U8): Unit =
+    j = deref_ptr (transmute p : Ptr JobStream)
+    body: fn (Ptr Runtime) Stream -> Unit can Async = transmute j.body
+    run_uv j.rt fn () -> body j.rt j.arg
+    free p
+
+/// Run `body` as the first task of a runtime of its own, until every task has finished and
+/// the loop has nothing left to wait on. An example's whole `main`.
+run_async (body: fn (Ptr Runtime) -> Unit can Async): Unit =
+    rtp = rt_new ()
+    cell: Ptr Job = malloc (size_of (MkType : Type Job))
+    ptr_store cell (Job rtp (transmute body))
+    ignore (spawn_default rtp (transmute (job_entry : fn (Ptr U8) -> Unit)) (transmute cell))
+    run rtp
+    shutdown rtp
+    rt_free rtp
+
+/// Start another task on the same runtime, running `body rtp n`. Legal from a task's own
+/// stack, where the new task runs immediately up to its first park, and from outside one.
+spawn_async (rtp: Ptr Runtime) (body: fn (Ptr Runtime) I64 -> Unit can Async) (n: I64): Unit =
+    cell: Ptr JobI64 = malloc (size_of (MkType : Type JobI64))
+    ptr_store cell (JobI64 rtp (transmute body) n)
+    ignore (spawn_default rtp (transmute (job_entry_i64 : fn (Ptr U8) -> Unit)) (transmute cell))
+
+/// The same for a task handed a stream: one accepted connection, one handler.
+spawn_stream (rtp: Ptr Runtime) (body: fn (Ptr Runtime) Stream -> Unit can Async) (s: Stream): Unit =
+    cell: Ptr JobStream = malloc (size_of (MkType : Type JobStream))
+    ptr_store cell (JobStream rtp (transmute body) s)
+    ignore (spawn_default rtp (transmute (job_entry_stream : fn (Ptr U8) -> Unit)) (transmute cell))

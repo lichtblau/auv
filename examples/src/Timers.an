@@ -1,0 +1,42 @@
+// Timers: three tasks, three schedules, one event loop.
+//
+//     ./examples/run.sh timers
+//
+// `sleep` parks the task that calls it. Nothing else stops: while one ticker waits out its
+// interval the loop is free to wake the other two, so the three schedules interleave even
+// though each task is written as if it were the only one.
+
+import Local.Uv.Run.run_async, spawn_async
+import Local.Uv.Task.Runtime
+import Local.Uv.Async.Async, sleep
+
+// A ticker is identified by a number, and its schedule follows from it.
+every_ms (id: I64): U64 = if id == 1 then 120u64 else if id == 2 then 200u64 else 350u64
+ticks (id: I64): I64 = if id == 1 then 5 else if id == 2 then 3 else 2
+
+ticker (_rtp: Ptr Runtime) (id: I64): Unit can Async =
+    var done = 0
+    while done < ticks id do
+        sleep (every_ms id)
+        done := done + 1
+        print "task "
+        print id
+        print ": tick "
+        print done
+        print "/"
+        println (ticks id)
+    print "task "
+    print id
+    println ": finished"
+
+// The first task starts the other two and then does a ticker's work itself. A spawned task
+// runs immediately, up to its first park, so by the time this returns all three are waiting
+// on their own timers.
+tickers (rtp: Ptr Runtime): Unit can Async =
+    spawn_async rtp ticker 2
+    spawn_async rtp ticker 3
+    ticker rtp 1
+
+main () =
+    run_async tickers
+    println "all tickers finished"

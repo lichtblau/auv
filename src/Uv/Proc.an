@@ -1,0 +1,134 @@
+// Child processes over the Async effect.
+//
+// A child's three standard streams are ordinary Streams, so everything in Stream.an applies
+// to them: reads park, writes park, closing wakes a parked reader.
+//
+// Exit and output are independent. A child can exit while bytes it already wrote are still
+// sitting in a pipe, so the exit status lands in the process handle's own wait slot and stays
+// there until somebody asks for it -- reading the output first is always safe.
+//
+// uv_tty is deliberately absent. Adopting a terminal collides with whatever else in the
+// program is managing raw mode, and that is a decision for the program, not for a binding.
+
+import Local.Uv.Uv.Loop, copy_loop, Slot, copy_slot, slot_new, Completion, copy_completion,
+    k_exit, k_cancelled, UvError, uv_error_of,
+    handle_null, handle_is_null, handle_adopt_slot, close_handle,
+    pipe_new, process_spawn, process_kill, process_pid,
+    buf_alloc, buf_free, ptr_at, ptr_set, cstr_of_string, i32_at, as_i64
+import Local.Uv.Task.Runtime, rt_loop
+import Local.Uv.Async.Async, submit, Submission, copy_submission, sub_op2, op_wait_exit
+import Local.Uv.Stream.Stream, copy_stream, stream_null, stream_is_null, stream_of_handle,
+    stream_close
+import Std.Vec.Vec, empty, push, len
+
+export
+    Child, copy_child, child_pid, child_stdin, child_stdout, child_stderr,
+    Exit, copy_exit, exit_code, exit_signal, exited_normally,
+    spawn_child, wait_exit, kill_child, child_close, child_close_stdin
+
+// --- a child --------------------------------------------------------------------------------
+
+type Child =
+    handle: Ptr U8
+    slot: Slot
+    stdin: Stream
+    stdout: Stream
+    stderr: Stream
+
+impl copy_child: Copy Child with (.*) = deref
+
+child_pid (c: ref Child): I32 = process_pid c.handle
+child_stdin (c: ref Child): Stream = c.stdin
+child_stdout (c: ref Child): Stream = c.stdout
+child_stderr (c: ref Child): Stream = c.stderr
+
+type Exit =
+    code: I64
+    signal: I64
+
+impl copy_exit: Copy Exit with (.*) = deref
+
+exit_code (e: Exit): I64 = e.code
+exit_signal (e: Exit): I64 = e.signal
+
+/// True when the child ran to completion rather than being killed by a signal.
+exited_normally (e: Exit): Bool = e.signal == 0
+
+// --- spawning ---------------------------------------------------------------------------------
+
+// Build the NULL-terminated `char **` uv_spawn wants. By convention the program name is also
+// the first argument, so the caller's `args` are what follows it.
+build_argv (file: ref String) (args: ref Vec String): Ptr U8 =
+    n = args.len
+    vec = buf_alloc ((n + 2usz) * 8usz)
+    ptr_set vec 0usz (cstr_of_string file)
+    var i = 0usz
+    while i < n do
+        ptr_set vec (i + 1usz) (cstr_of_string (ptr_to_mut (offset args.data i)))
+        i := i + 1usz
+    ptr_set vec (n + 1usz) (handle_null ())
+    vec
+
+free_argv (vec: Ptr U8) (n: Usz): Unit =
+    var i = 0usz
+    while i < n + 1usz do
+        buf_free (ptr_at vec i)
+        i := i + 1usz
+    buf_free vec
+
+/// Spawn `file` with `args` as its arguments (the program name is supplied as argv[0]
+/// automatically), giving it a pipe for each of the three standard streams.
+spawn_child (rtp: Ptr Runtime) (file: ref String) (args: ref Vec String): Result Child UvError can Async =
+    lp = rt_loop rtp
+    hin = pipe_new lp false
+    hout = pipe_new lp false
+    herr = pipe_new lp false
+    if handle_is_null hin or handle_is_null hout or handle_is_null herr then
+        close_handle hin
+        close_handle hout
+        close_handle herr
+        Error (uv_error_of -12)
+    else
+        argv = build_argv file args
+        errcell = buf_alloc 4usz
+        hp = process_spawn lp (ptr_at argv 0usz) argv (handle_null ())
+                              hin hout herr errcell
+        code = i32_at errcell 0usz
+        free_argv argv args.len
+        buf_free errcell
+        if handle_is_null hp then
+            close_handle hin
+            close_handle hout
+            close_handle herr
+            Error (uv_error_of code)
+        else
+            sl = slot_new ()
+            handle_adopt_slot hp sl
+            Ok (Child hp sl (stream_of_handle hin) (stream_of_handle hout) (stream_of_handle herr))
+
+/// Wait for the child to exit. Safe to call after its output has already been drained: the
+/// exit status waits in the process handle's slot until it is read.
+wait_exit (c: ref Child): Result Exit UvError can Async =
+    comp = submit (sub_op2 (op_wait_exit ()) 0 c.handle)
+    if comp.kind == k_cancelled () then Error (uv_error_of -125)
+    else if comp.kind != k_exit () then Error (uv_error_of -9)
+    else Ok (Exit comp.status comp.aux)
+
+/// Send a signal to the child.
+kill_child (c: ref Child) (signum: I32): I32 = process_kill c.handle signum
+
+/// Close the child's standard input, which is how the child is told there is no more of it.
+/// Its output streams stay open.
+child_close_stdin (c: ref Child): Unit = stream_close c.stdin
+
+/// Close the child's pipes and its process handle. Closing a stream is idempotent and every
+/// copy of the wrapper sees it, so this is safe after `child_close_stdin`.
+child_close (c: mut Child): Unit =
+    stream_close c.stdin
+    stream_close c.stdout
+    stream_close c.stderr
+    if not (handle_is_null c.handle) then
+        h = c.handle
+        c.handle := handle_null ()
+        c.slot := Slot (handle_null ())
+        close_handle h

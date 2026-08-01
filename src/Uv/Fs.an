@@ -1,0 +1,327 @@
+// Files and name resolution over the Async effect.
+//
+// These are the operations libuv runs on its threadpool. The completion still arrives on the
+// loop thread -- libuv guarantees it, and every trampoline in the shim checks it -- which is
+// what makes it safe for a filesystem result to resume a coroutine at all.
+//
+// Results that are more than a number are marshalled into the wait slot's payload: a read
+// buffer as it stands, a stat as four packed integers, a directory or an address list as
+// newline-separated text. Nothing here needs Ante and C to agree on a struct layout.
+
+import Local.Uv.Uv.Completion, copy_completion, k_fs, k_addrinfo, k_cancelled,
+    UvError, uv_check, uv_error_of,
+    handle_null, handle_is_null, buf_free, buf_string, cstr_of_string, as_i64, as_usz
+import Local.Uv.Async.Async, submit, Submission, copy_submission, op_fs, op_addrinfo,
+    sub_fs, sub_addrinfo
+import Std.Vec.Vec, empty, push, len
+
+
+export
+    FileInfo, copy_fileinfo, fi_size, fi_is_dir, fi_mode, fi_mtime,
+    o_rdonly, o_wronly, o_rdwr, o_creat, o_trunc, o_append, o_excl,
+    fso_open, fso_read, fso_write, fso_close, fso_stat, fso_scandir,
+    fso_mkdir, fso_unlink, fso_rename, fso_rmdir,
+    DirEntry, fs_open, fs_read, fs_write, fs_close, fs_stat, fs_scandir, fs_scandir_entries,
+    fs_mkdir, fs_rmdir, fs_unlink, fs_rename,
+    read_file, write_file, resolve
+
+// --- the operations, as the shim numbers them ------------------------------------------------
+// Exported, because this is the numbering and there should be exactly one copy of it: a caller
+// working at Layer 0/1 (`Uv.fs_submit` + a park, for code that cannot be typed `can Async`) needs
+// the same numbers this module hands `sub_fs`.
+fso_open (): I64 = 1
+fso_read (): I64 = 2
+fso_write (): I64 = 3
+fso_close (): I64 = 4
+fso_stat (): I64 = 5
+fso_scandir (): I64 = 6
+fso_mkdir (): I64 = 7
+fso_unlink (): I64 = 8
+fso_rename (): I64 = 9
+fso_rmdir (): I64 = 10
+
+// Open flags, read from the shim because their values are platform-specific.
+auv_o_rdonly = extern "auv_o_rdonly": fn Unit -> I32
+auv_o_wronly = extern "auv_o_wronly": fn Unit -> I32
+auv_o_rdwr   = extern "auv_o_rdwr":   fn Unit -> I32
+auv_o_creat  = extern "auv_o_creat":  fn Unit -> I32
+auv_o_trunc  = extern "auv_o_trunc":  fn Unit -> I32
+auv_o_append = extern "auv_o_append": fn Unit -> I32
+auv_o_excl   = extern "auv_o_excl":   fn Unit -> I32
+
+auv_stat_field = extern "auv_stat_field": fn (Ptr U8) Usz -> I64
+
+o_rdonly (): I64 = I64 (auv_o_rdonly ())
+o_wronly (): I64 = I64 (auv_o_wronly ())
+o_rdwr (): I64 = I64 (auv_o_rdwr ())
+o_creat (): I64 = I64 (auv_o_creat ())
+o_trunc (): I64 = I64 (auv_o_trunc ())
+o_append (): I64 = I64 (auv_o_append ())
+o_excl (): I64 = I64 (auv_o_excl ())
+
+// --- results --------------------------------------------------------------------------------
+
+type FileInfo =
+    size: I64
+    mode: I64
+    is_dir: Bool
+    mtime: I64
+
+impl copy_fileinfo: Copy FileInfo with (.*) = deref
+
+fi_size (f: FileInfo): I64 = f.size
+fi_mode (f: FileInfo): I64 = f.mode
+fi_is_dir (f: FileInfo): Bool = f.is_dir
+fi_mtime (f: FileInfo): I64 = f.mtime
+
+// A completion whose status is negative is an error; cancellation is ECANCELED.
+fs_status (c: Completion): Result I64 UvError =
+    if c.kind == k_cancelled () then Error (uv_error_of -125)
+    else if c.status < 0 then Error (uv_error_of (I32 c.status))
+    else Ok c.status
+
+// --- the operations ---------------------------------------------------------------------------
+
+/// Open a file, returning its descriptor.
+fs_open (path: ref String) (flags: I64) (mode: I64): Result I32 UvError can Async =
+    p = cstr_of_string path
+    c = submit (sub_fs (fso_open ()) flags mode 0 p (handle_null ()))
+    buf_free p
+    match fs_status c
+    | Ok fd -> Ok (I32 fd)
+    | Error e -> Error e
+
+/// Read up to `len` bytes from `offset`. A short result is normal; an empty string is the end
+/// of the file.
+fs_read (fd: I32) (len: Usz) (offset: I64): Result String UvError can Async =
+    c = submit (sub_fs (fso_read ()) (I64 fd) (as_i64 (U64 len)) offset
+                       (handle_null ()) (handle_null ()))
+    match fs_status c
+    | Error e -> Error e
+    | Ok _n ->
+        text = buf_string c.payload (as_usz c.aux)
+        buf_free c.payload
+        Ok text
+
+/// Write bytes at `offset`, returning how many were taken.
+fs_write (fd: I32) (bytes: ref String) (offset: I64): Result I64 UvError can Async =
+    c = submit (sub_fs (fso_write ()) (I64 fd) (as_i64 (U64 (Usz bytes.length))) offset
+                       (transmute bytes.data) (handle_null ()))
+    fs_status c
+
+fs_close (fd: I32): Result Unit UvError can Async =
+    c = submit (sub_fs (fso_close ()) (I64 fd) 0 0 (handle_null ()) (handle_null ()))
+    match fs_status c
+    | Ok _n -> Ok ()
+    | Error e -> Error e
+
+fs_stat (path: ref String): Result FileInfo UvError can Async =
+    p = cstr_of_string path
+    c = submit (sub_fs (fso_stat ()) 0 0 0 p (handle_null ()))
+    buf_free p
+    match fs_status c
+    | Error e -> Error e
+    | Ok _n ->
+        info = FileInfo (auv_stat_field c.payload 0usz) (auv_stat_field c.payload 1usz)
+                        (auv_stat_field c.payload 2usz != 0) (auv_stat_field c.payload 3usz)
+        buf_free c.payload
+        Ok info
+
+/// Directory entries, without "." and "..".
+fs_scandir (path: ref String): Result (Vec String) UvError can Async =
+    p = cstr_of_string path
+    c = submit (sub_fs (fso_scandir ()) 0 0 0 p (handle_null ()))
+    buf_free p
+    match fs_status c
+    | Error e -> Error e
+    | Ok _n ->
+        text = buf_string c.payload (as_usz c.aux)
+        buf_free c.payload
+        Ok (names_of text)
+
+/// The same listing, keeping what the shim already knew: whether each entry is a DIRECTORY.
+///
+/// `readdir` returns that alongside the name, so it costs nothing here and saves the caller a
+/// `stat` per entry -- which is the whole point, for anyone listing a directory to decide what to
+/// descend into. `known` is false where the filesystem does not carry the type (XFS without ftype,
+/// some network mounts report DT_UNKNOWN); such a caller must stat those few itself, and only
+/// those.
+///
+/// NOT a `Result`, and that is a compiler workaround rather than a taste: an empty listing is what
+/// a failure looks like here. Returning `Result (Vec DirEntry) UvError` and matching it SEGFAULTS
+/// under `-O3` (the editor's optimization level; the test lane's default is lower, which is why
+/// this only shows up in pc). The generated C tells the story -- `Result`'s payload field is typed
+/// as the LARGER variant, `UvError` at 56 bytes against the Vec's 24, so the Ok arm `memcpy`s 24 of
+/// 56 and the arm's drop glue then runs over bytes that are a Vec reinterpreted as two Strings.
+/// It is the same match-move-of-an-owned-value gap this tree has hit before, sharpened by the two
+/// variants disagreeing about layout AND both needing drop glue. `Result FileInfo UvError` is fine
+/// (FileInfo is four scalars, no glue), which is why `fs_stat` next door can stay as it is.
+fs_scandir_entries (path: ref String): Vec DirEntry can Async =
+    p = cstr_of_string path
+    c = submit (sub_fs (fso_scandir ()) 0 0 0 p (handle_null ()))
+    buf_free p
+    if c.kind == k_cancelled () or c.status < 0 then Vec.empty ()
+    else
+        text = buf_string c.payload (as_usz c.aux)
+        buf_free c.payload
+        entries_of text
+
+fs_mkdir (path: ref String) (mode: I64): Result Unit UvError can Async =
+    p = cstr_of_string path
+    c = submit (sub_fs (fso_mkdir ()) mode 0 0 p (handle_null ()))
+    buf_free p
+    match fs_status c
+    | Ok _n -> Ok ()
+    | Error e -> Error e
+
+fs_rmdir (path: ref String): Result Unit UvError can Async =
+    p = cstr_of_string path
+    c = submit (sub_fs (fso_rmdir ()) 0 0 0 p (handle_null ()))
+    buf_free p
+    match fs_status c
+    | Ok _n -> Ok ()
+    | Error e -> Error e
+
+fs_unlink (path: ref String): Result Unit UvError can Async =
+    p = cstr_of_string path
+    c = submit (sub_fs (fso_unlink ()) 0 0 0 p (handle_null ()))
+    buf_free p
+    match fs_status c
+    | Ok _n -> Ok ()
+    | Error e -> Error e
+
+fs_rename (from: ref String) (to: ref String): Result Unit UvError can Async =
+    a = cstr_of_string from
+    b = cstr_of_string to
+    c = submit (sub_fs (fso_rename ()) 0 0 0 a b)
+    buf_free a
+    buf_free b
+    match fs_status c
+    | Ok _n -> Ok ()
+    | Error e -> Error e
+
+// --- convenience ---------------------------------------------------------------------------------
+
+read_chunk (): Usz = 65536usz
+
+/// Read a whole file.
+read_file (path: ref String): Result String UvError can Async =
+    match fs_open path (o_rdonly ()) 0
+    | Error e -> Error e
+    | Ok fd ->
+        var acc = ""
+        var at = 0
+        var going = true
+        var failed = false
+        var err = uv_error_of 0
+        while going do
+            match fs_read fd (read_chunk ()) at
+            | Error e ->
+                err := e
+                failed := true
+                going := false
+            | Ok chunk ->
+                n = Usz chunk.length
+                if n == 0usz then going := false
+                else
+                    at := at + as_i64 (U64 n)
+                    acc := acc ++ chunk
+        ignore (fs_close fd)
+        if failed then Error err else Ok acc
+
+/// Create or truncate a file and write the whole string to it.
+write_file (path: ref String) (bytes: ref String): Result Unit UvError can Async =
+    flags = o_wronly () + o_creat () + o_trunc ()
+    match fs_open path flags 420          // 0644
+    | Error e -> Error e
+    | Ok fd ->
+        r = fs_write fd bytes 0
+        ignore (fs_close fd)
+        match r
+        | Ok _n -> Ok ()
+        | Error e -> Error e
+
+// --- name resolution -------------------------------------------------------------------------------
+
+/// Resolve a host (and optional service) to numeric addresses.
+resolve (host: ref String) (service: ref String): Result (Vec String) UvError can Async =
+    h = cstr_of_string host
+    sv = cstr_of_string service
+    c = submit (sub_addrinfo h sv)
+    buf_free h
+    buf_free sv
+    if c.kind == k_cancelled () then Error (uv_error_of -125)
+    else if c.status < 0 then Error (uv_error_of (I32 c.status))
+    else
+        text = buf_string c.payload (as_usz c.aux)
+        buf_free c.payload
+        Ok (lines_of text)
+
+// --- shared -----------------------------------------------------------------------------------------
+
+/// One directory entry: its name, and whether the filesystem said it is a directory.
+///
+/// `known` is what separates "it is not a directory" from "nobody told us". A caller that must be
+/// certain stats the `not known` ones and nothing else.
+type DirEntry =
+    name: String
+    is_dir: Bool
+    known: Bool
+
+// A scandir payload: one "<T><name>\n" line per entry, T being 'd' / 'f' / '?'. A line with no name
+// -- which the shim never emits, but a truncated payload could -- is dropped rather than turned
+// into an entry with an empty name.
+//
+// Each name is COPIED rather than carved out of `text` with a shared-buffer substring, for the
+// reason `lines_of` gives below.
+entries_of (text: String): Vec DirEntry =
+    var out: Vec DirEntry = Vec.empty ()
+    n = Usz text.length
+    var start = 0usz
+    var i = 0usz
+    while i < n do
+        ch: Char = deref_ptr (offset text.data i)
+        if ch == '\n' then
+            if i > start + 1usz then
+                tag: Char = deref_ptr (offset text.data start)
+                nm = buf_string (transmute (offset text.data (start + 1usz))) (i - start - 1usz)
+                out.push (DirEntry nm (tag == 'd') (tag != '?'))
+            start := i + 1usz
+        i := i + 1usz
+    out
+
+// The names out of a scandir payload, dropping each line's type byte. `lines_of` is not that
+// function: an addrinfo payload has no type byte, so the two formats need two readers.
+names_of (text: String): Vec String =
+    var out: Vec String = Vec.empty ()
+    n = Usz text.length
+    var start = 0usz
+    var i = 0usz
+    while i < n do
+        ch: Char = deref_ptr (offset text.data i)
+        if ch == '\n' then
+            if i > start + 1usz then
+                out.push (buf_string (transmute (offset text.data (start + 1usz))) (i - start - 1usz))
+            start := i + 1usz
+        i := i + 1usz
+    out
+
+// The shim marshals a list as newline-separated text with a trailing separator. Empty
+// stretches are skipped, so the trailing one contributes nothing.
+//
+// Each line is COPIED rather than carved out of `text` with a shared-buffer substring. The
+// pieces outlive the text they came from, and sharing one reference count across a vector of
+// them is exactly the shape that has bitten this tree before.
+lines_of (text: String): Vec String =
+    var out: Vec String = Vec.empty ()
+    n = Usz text.length
+    var start = 0usz
+    var i = 0usz
+    while i < n do
+        ch: Char = deref_ptr (offset text.data i)
+        if ch == '\n' then
+            if i > start then out.push (buf_string (transmute (offset text.data start)) (i - start))
+            start := i + 1usz
+        i := i + 1usz
+    if n > start then out.push (buf_string (transmute (offset text.data start)) (n - start))
+    out

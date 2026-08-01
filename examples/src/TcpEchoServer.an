@@ -1,0 +1,74 @@
+// A TCP echo server: one task per connection, reading and writing until the peer goes away.
+//
+//     ./examples/run.sh tcp-echo-server
+//
+// Then, in another terminal:
+//
+//     ./examples/run.sh tcp-echo-client
+//     nc 127.0.0.1 1234
+//
+// Ctrl-C stops it. There is no callback anywhere: a connection handler is a straight-line
+// loop that reads, writes and eventually returns, and the parks inside `aread`/`awrite` are
+// what let one loop carry hundreds of them at once.
+//
+// Backpressure comes for free. A stream is read only while a task is parked on it, so a
+// connection whose handler is busy stops being read, and that stops the sender.
+
+import Local.Uv.Run.run_async, spawn_stream
+import Local.Uv.Uv.UvError, uv_error_text
+import Local.Uv.Task.Runtime
+import Local.Uv.Async.Async
+import Local.Uv.Stream.Stream, copy_stream, stream_free, stream_fd,
+    Listener, copy_listener, listener_bind, listener_close, listener_port, accept,
+    AsyncRead, aread, stream_async_read, AsyncWrite, awrite, stream_async_write, ashutdown
+
+port (): I32 = 1234
+
+// A number as decimal text. `String` on its own is the type's constructor, so the cast has to
+// be spelled out.
+num (v: I64): String = cast (I32 v)
+
+// One connection. `aread` returns `Ok None` at end of file, which is how a peer that hung up
+// or half-closed is reported.
+echo (_rtp: Ptr Runtime) (s: Stream): Unit can Async =
+    who = "connection on fd " ++ num (I64 (stream_fd s))
+    println (clone who ++ ": open")
+    var going = true
+    var bytes = 0
+    while going do
+        match aread s
+        | Ok (Some chunk) ->
+            bytes := bytes + I64 (Usz chunk.length)
+            match awrite s chunk
+            | Ok _u -> ()
+            | Error e ->
+                println (clone who ++ ": write failed: " ++ uv_error_text (ref e))
+                going := false
+        | Ok None -> going := false
+        | Error e ->
+            println (clone who ++ ": read failed: " ++ uv_error_text (ref e))
+            going := false
+    // Half-close so the peer sees end of file, then release the stream. Closing is idempotent
+    // and wakes anyone still parked on it.
+    ignore (ashutdown s)
+    stream_free s
+    println (who ++ ": closed after " ++ num bytes ++ " bytes")
+
+// Binding and listening need no task -- only the accept parks -- but doing them here keeps
+// the listener's whole life in one function.
+serve (rtp: Ptr Runtime): Unit can Async =
+    match listener_bind rtp "127.0.0.1" (port ()) 128
+    | Error e -> println ("bind failed: " ++ uv_error_text (ref e))
+    | Ok l ->
+        println ("echo server listening on 127.0.0.1:" ++ num (I64 (listener_port l)))
+        println "(Ctrl-C to stop)"
+        var going = true
+        while going do
+            match accept rtp l
+            | Ok s -> spawn_stream rtp echo s
+            | Error e ->
+                println ("accept failed: " ++ uv_error_text (ref e))
+                going := false
+        listener_close l
+
+main () = run_async serve

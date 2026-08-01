@@ -1,0 +1,76 @@
+// Files: make a directory, write, stat, read, list, clean up.
+//
+//     ./examples/run.sh fs-basic
+//
+// Every call below is an ordinary `Async` submission, which is why the body runs twice at the
+// bottom of this file: once under a real event loop, where libuv's threadpool does the work
+// and the task parks until the result lands, and once under `blocking`, where plain libc does
+// it on main's own stack -- no loop, no task, no coroutine. Same code, two handlers.
+
+import Local.Uv.Run.run_async
+import Local.Uv.Uv.UvError, uv_error_text
+import Local.Uv.Task.Runtime
+import Local.Uv.Async.Async, blocking
+import Local.Uv.Fs.FileInfo, copy_fileinfo, fi_size, fi_is_dir,
+    DirEntry, fs_mkdir, fs_rmdir, fs_unlink, fs_stat, fs_scandir_entries,
+    read_file, write_file
+import Std.Vec.Vec, len
+
+dir (): String = "/tmp/auv-fs-example"
+
+// A number as decimal text. `String` on its own is the type's constructor, so the cast has to
+// be spelled out.
+num (v: I64): String = cast (I32 v)
+
+// Nothing here says how the operations are carried out; that is the handler's business. None
+// of them needs the runtime either -- only the operations that create a handle (connect,
+// accept, spawn_child) do.
+demo (): Unit can Async =
+    // `++` takes ownership of its left side, so a String that is concatenated is `clone`d
+    // wherever it is still wanted afterwards.
+    name = dir () ++ "/hello.txt"
+    body = "hello from the auv fs example\n"
+
+    // Already there is not worth distinguishing from freshly made, so the result is dropped.
+    ignore (fs_mkdir (dir ()) 493)          // 0755
+
+    match write_file name body
+    | Error e -> println ("write failed: " ++ uv_error_text (ref e))
+    | Ok _u -> println ("wrote " ++ clone name)
+
+    match fs_stat name
+    | Error e -> println ("stat failed: " ++ uv_error_text (ref e))
+    | Ok info ->
+        println ("  size:   " ++ num (fi_size info) ++ " bytes")
+        println ("  is dir: " ++ (if fi_is_dir info then "yes" else "no"))
+
+    match read_file name
+    | Error e -> println ("read failed: " ++ uv_error_text (ref e))
+    | Ok back -> print ("read back: " ++ back)
+
+    // `fs_scandir_entries` keeps what readdir already knew about each name, so listing a
+    // directory costs no stat per entry. `known` is false where the filesystem does not carry
+    // the type at all, and only those entries need a stat of their own.
+    println ("listing " ++ dir () ++ ":")
+    ents = fs_scandir_entries (dir ())
+    var i = 0usz
+    while i < ents.len do
+        e = ptr_to_mut (offset ents.data i)
+        kind = if not e.known then "?   " else if e.is_dir then "dir " else "file"
+        println ("  " ++ kind ++ "  " ++ clone e.name)
+        i := i + 1usz
+
+    ignore (fs_unlink name)
+    ignore (fs_rmdir (dir ()))
+    println "cleaned up"
+
+// `run_async` hands its body the runtime, which this one has no use for.
+on_a_loop (_rtp: Ptr Runtime): Unit can Async = demo ()
+
+main () =
+    println "--- on a loop: libuv's threadpool, the task parks until the result lands ---"
+    run_async on_a_loop
+
+    println ""
+    println "--- under blocking: plain libc on this stack, no loop and no task ---"
+    blocking fn () -> demo ()

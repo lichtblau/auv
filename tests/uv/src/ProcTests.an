@@ -1,0 +1,296 @@
+// Child-process suite: pipes in both directions, exit status, signals, adopted descriptors.
+
+import Local.Harness.TestState, ok, is_i32, is_i64, is_usz
+import Local.Uv.Uv.Completion, copy_completion, handle_is_null, loop_thread_faults,
+    buf_alloc, buf_free, i32_at, socketpair_fds, fd_close, fd_write_string, sigterm,
+    as_i64, UvError, uv_error_text
+import Local.Uv.Task.Runtime, rt_new, rt_free, rt_loop, rt_live_count,
+    spawn_default, run, shutdown, sleep_ms
+import Local.Uv.Async.Async, run_uv, sleep
+import Local.Uv.Stream.Stream, copy_stream, stream_free, stream_close, stream_adopt_fd,
+    AsyncRead, aread, stream_async_read, AsyncWrite, awrite, stream_async_write,
+    ashutdown, read_all
+import Local.Uv.Proc.Child, copy_child, Exit, copy_exit, exit_code, exit_signal,
+    exited_normally, spawn_child, wait_exit, kill_child, child_close, child_close_stdin, child_pid,
+    child_stdin, child_stdout, child_stderr
+import Std.Vec.Vec, empty, push, len
+import Std.C.malloc, free
+import Std.String.eq_string
+
+export run_proc_tests
+
+// --- shared shapes ---------------------------------------------------------------------------
+
+type PArg =
+    rt: Ptr Runtime
+    log: Ptr (Vec I64)
+    out: Ptr String
+    err: Ptr String
+    n: I64
+
+impl copy_parg: Copy PArg with (.*) = deref
+
+parg_of (p: Ptr U8): PArg = deref_ptr (transmute p : Ptr PArg)
+
+new_pargs (n: Usz): Ptr PArg = malloc (n * size_of (MkType : Type PArg))
+parg_slot (base: Ptr PArg) (i: Usz): Ptr PArg = offset base i
+
+new_log (): Ptr (Vec I64) =
+    p: Ptr (Vec I64) = malloc (size_of (MkType : Type (Vec I64)))
+    ptr_store p (Vec.empty ())
+    p
+
+log_push (p: Ptr (Vec I64)) (v: I64): Unit =
+    lg = ptr_to_mut p
+    lg.push v
+
+log_at (p: Ptr (Vec I64)) (i: Usz): I64 =
+    lg = ptr_to_mut p
+    if i >= lg.len then -1 else deref_ptr (offset lg.data i)
+
+log_len (p: Ptr (Vec I64)): Usz = (ptr_to_mut p).len
+
+free_log (p: Ptr (Vec I64)): Unit =
+    lg = ptr_to_mut p
+    if not (handle_is_null (transmute lg.data)) then free (transmute lg.data)
+    free (transmute p)
+
+new_text (): Ptr String =
+    p: Ptr String = malloc (size_of (MkType : Type String))
+    ptr_store p ""
+    p
+
+text_get (p: Ptr String): String = clone (ptr_to_mut p)
+
+// --- both pipes and the exit status ----------------------------------------------------------
+
+// /bin/sh writes a line to each stream and exits 3. All three -- the two pipes and the status
+// -- have to come back, and the reads happen BEFORE the wait, which is the ordering a child
+// that exits before its output is drained would otherwise break.
+capture_task (p: Ptr U8): Unit =
+    arg = parg_of p
+    run_uv arg.rt fn () ->
+        var argv: Vec String = Vec.empty ()
+        argv.push "-c"
+        argv.push "echo out; echo err >&2; exit 3"
+        match spawn_child arg.rt "/bin/sh" (ref argv)
+        | Error _e -> log_push arg.log -1
+        | Ok ch ->
+            var c = ch
+            match read_all (child_stdout (ref c))
+            | Ok text -> ptr_store arg.out text
+            | Error _e -> log_push arg.log -2
+            match read_all (child_stderr (ref c))
+            | Ok text -> ptr_store arg.err text
+            | Error _e -> log_push arg.log -3
+            match wait_exit (ref c)
+            | Error _e -> log_push arg.log -4
+            | Ok st ->
+                log_push arg.log (exit_code st)
+                log_push arg.log (exit_signal st)
+            child_close (mut c)
+
+test_capture (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    out = new_text ()
+    err = new_text ()
+    args = new_pargs 1usz
+    ptr_store (parg_slot args 0usz) (PArg rtp lg out err 0)
+    ignore (spawn_default rtp (transmute (capture_task : fn (Ptr U8) -> Unit))
+                              (transmute (parg_slot args 0usz)))
+    run rtp
+
+    t.is_usz "capture: the child was waited on" (log_len lg) 2usz
+    t.is_i64 "capture: it exited 3" (log_at lg 0usz) 3
+    t.is_i64 "capture: and not by a signal" (log_at lg 1usz) 0
+    t.ok "capture: stdout came back" (text_get out == "out\n")
+    t.ok "capture: stderr came back" (text_get err == "err\n")
+    t.is_i64 "capture: no completion off the loop thread" (loop_thread_faults (rt_loop rtp)) 0
+
+    shutdown rtp
+    rt_free rtp
+    free_log lg
+    free (transmute out)
+    free (transmute err)
+    free (transmute args)
+
+// --- writing to a child ------------------------------------------------------------------------
+
+// `cat` echoes whatever it is given, once its input has been closed.
+cat_task (p: Ptr U8): Unit =
+    arg = parg_of p
+    run_uv arg.rt fn () ->
+        var argv: Vec String = Vec.empty ()
+        match spawn_child arg.rt "/bin/cat" (ref argv)
+        | Error _e -> log_push arg.log -1
+        | Ok ch ->
+            var c = ch
+            ignore (awrite (child_stdin (ref c)) "through the pipe\n")
+            child_close_stdin (ref c)
+            match read_all (child_stdout (ref c))
+            | Ok text -> ptr_store arg.out text
+            | Error _e -> log_push arg.log -2
+            match wait_exit (ref c)
+            | Ok st -> log_push arg.log (exit_code st)
+            | Error _e -> log_push arg.log -3
+            child_close (mut c)
+
+test_write_to_child (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    out = new_text ()
+    err = new_text ()
+    args = new_pargs 1usz
+    ptr_store (parg_slot args 0usz) (PArg rtp lg out err 0)
+    ignore (spawn_default rtp (transmute (cat_task : fn (Ptr U8) -> Unit))
+                              (transmute (parg_slot args 0usz)))
+    run rtp
+
+    t.ok "write_to_child: cat echoed the input" (text_get out == "through the pipe\n")
+    t.is_i64 "write_to_child: and exited cleanly" (log_at lg 0usz) 0
+
+    shutdown rtp
+    rt_free rtp
+    free_log lg
+    free (transmute out)
+    free (transmute err)
+    free (transmute args)
+
+// --- signalling a child -------------------------------------------------------------------------
+
+// A sleeping child is killed rather than waited out: the exit comes back with the signal that
+// ended it and an exit code of zero.
+kill_task (p: Ptr U8): Unit =
+    arg = parg_of p
+    run_uv arg.rt fn () ->
+        var argv: Vec String = Vec.empty ()
+        argv.push "30"
+        match spawn_child arg.rt "/bin/sleep" (ref argv)
+        | Error _e -> log_push arg.log -1
+        | Ok ch ->
+            var c = ch
+            log_push arg.log (if child_pid (ref c) > 0 then 1 else -2)
+            sleep 50u64
+            log_push arg.log (I64 (kill_child (ref c) (sigterm ())))
+            match wait_exit (ref c)
+            | Error _e -> log_push arg.log -3
+            | Ok st ->
+                log_push arg.log (exit_signal st)
+                log_push arg.log (if exited_normally st then 1 else 0)
+            child_close (mut c)
+
+test_kill (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    out = new_text ()
+    err = new_text ()
+    args = new_pargs 1usz
+    ptr_store (parg_slot args 0usz) (PArg rtp lg out err 0)
+    ignore (spawn_default rtp (transmute (kill_task : fn (Ptr U8) -> Unit))
+                              (transmute (parg_slot args 0usz)))
+    run rtp
+
+    t.is_usz "kill: the child was spawned, signalled and waited on" (log_len lg) 4usz
+    t.is_i64 "kill: it had a pid" (log_at lg 0usz) 1
+    t.is_i64 "kill: the signal was delivered" (log_at lg 1usz) 0
+    t.is_i64 "kill: it died of SIGTERM" (log_at lg 2usz) (I64 (sigterm ()))
+    t.is_i64 "kill: which is not a normal exit" (log_at lg 3usz) 0
+
+    shutdown rtp
+    rt_free rtp
+    free_log lg
+    free (transmute out)
+    free (transmute err)
+    free (transmute args)
+
+// --- an adopted descriptor -----------------------------------------------------------------------
+
+// One end of a socketpair, adopted as a stream and read through the loop; the other end is
+// written to with plain libc from a sibling task.
+adopted_reader (p: Ptr U8): Unit =
+    arg = parg_of p
+    run_uv arg.rt fn () ->
+        s = stream_adopt_fd arg.rt (I32 arg.n)
+        match read_all s
+        | Ok text -> ptr_store arg.out text
+        | Error _e -> log_push arg.log -1
+        stream_free s
+        log_push arg.log 1
+
+adopted_writer (p: Ptr U8): Unit =
+    arg = parg_of p
+    ignore (sleep_ms arg.rt 30)
+    ignore (fd_write_string (I32 arg.n) "adopted and read\n")
+    ignore (fd_close (I32 arg.n))
+
+test_adopt_fd (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    out = new_text ()
+    err = new_text ()
+    fds = buf_alloc 8usz
+    t.is_i32 "adopt_fd: socketpair created" (socketpair_fds fds) 0
+    a = i32_at fds 0usz
+    b = i32_at fds 1usz
+    args = new_pargs 2usz
+    ptr_store (parg_slot args 0usz) (PArg rtp lg out err (I64 a))
+    ptr_store (parg_slot args 1usz) (PArg rtp lg out err (I64 b))
+    ignore (spawn_default rtp (transmute (adopted_reader : fn (Ptr U8) -> Unit))
+                              (transmute (parg_slot args 0usz)))
+    ignore (spawn_default rtp (transmute (adopted_writer : fn (Ptr U8) -> Unit))
+                              (transmute (parg_slot args 1usz)))
+    run rtp
+
+    t.ok "adopt_fd: the bytes came through the adopted end" (text_get out == "adopted and read\n")
+    t.is_i64 "adopt_fd: the reader finished" (log_at lg 0usz) 1
+    t.is_usz "adopt_fd: nothing left parked" (rt_live_count rtp) 0usz
+
+    shutdown rtp
+    rt_free rtp
+    free_log lg
+    free (transmute out)
+    free (transmute err)
+    free (transmute args)
+    buf_free fds
+
+// --- a program that is not there ---------------------------------------------------------------------
+
+missing_task (p: Ptr U8): Unit =
+    arg = parg_of p
+    run_uv arg.rt fn () ->
+        var argv: Vec String = Vec.empty ()
+        match spawn_child arg.rt "/nonexistent/definitely-not-a-program" (ref argv)
+        | Ok ch ->
+            var c = ch
+            child_close (mut c)
+            log_push arg.log -1
+        | Error e -> log_push arg.log (I64 e.code)
+
+test_missing_program (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    out = new_text ()
+    err = new_text ()
+    args = new_pargs 1usz
+    ptr_store (parg_slot args 0usz) (PArg rtp lg out err 0)
+    ignore (spawn_default rtp (transmute (missing_task : fn (Ptr U8) -> Unit))
+                              (transmute (parg_slot args 0usz)))
+    run rtp
+
+    // UV_ENOENT is -2 everywhere libuv runs.
+    t.is_i64 "missing_program: spawning it fails with ENOENT" (log_at lg 0usz) -2
+
+    shutdown rtp
+    rt_free rtp
+    free_log lg
+    free (transmute out)
+    free (transmute err)
+    free (transmute args)
+
+run_proc_tests (t: mut TestState): Unit =
+    test_missing_program t
+    test_adopt_fd t
+    test_capture t
+    test_write_to_child t
+    test_kill t

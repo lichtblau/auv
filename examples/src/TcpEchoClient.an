@@ -1,0 +1,47 @@
+// The other half of tcp-echo-server: connect, send a line, read the echo back.
+//
+//     ./examples/run.sh tcp-echo-server      (in one terminal)
+//     ./examples/run.sh tcp-echo-client      (in another)
+//
+// Three clients run at once on one loop, which is the point: each one below is straight-line
+// code -- connect, write, half-close, read -- and they still overlap, because every step that
+// waits parks its own task instead of the program.
+
+import Local.Uv.Run.run_async, spawn_async
+import Local.Uv.Uv.UvError, uv_error_text
+import Local.Uv.Task.Runtime
+import Local.Uv.Async.Async
+import Local.Uv.Stream.Stream, copy_stream, stream_free, connect,
+    AsyncWrite, awrite, stream_async_write, AsyncRead, aread, stream_async_read,
+    ashutdown, read_all
+
+port (): I32 = 1234
+
+// A number as decimal text. `String` on its own is the type's constructor, so the cast has to
+// be spelled out.
+num (v: I64): String = cast (I32 v)
+
+failed (id: I64) (what: String) (e: ref UvError): Unit =
+    println ("client " ++ num id ++ ": " ++ what ++ " failed: " ++ uv_error_text e)
+
+talk (rtp: Ptr Runtime) (id: I64): Unit can Async =
+    match connect rtp "127.0.0.1" (port ())
+    | Error e -> failed id "connect" (ref e)
+    | Ok s ->
+        match awrite s ("hello from client " ++ num id ++ "\n")
+        | Error e -> failed id "write" (ref e)
+        | Ok _u ->
+            // Half-close: the server sees end of file and stops reading, but this side stays
+            // readable, so the echo still comes back.
+            ignore (ashutdown s)
+            match read_all s
+            | Error e -> failed id "read" (ref e)
+            | Ok back -> print ("client " ++ num id ++ " got back: " ++ back)
+        stream_free s
+
+clients (rtp: Ptr Runtime): Unit can Async =
+    spawn_async rtp talk 2
+    spawn_async rtp talk 3
+    talk rtp 1
+
+main () = run_async clients

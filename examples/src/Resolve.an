@@ -1,0 +1,48 @@
+// Name resolution: getaddrinfo, which libuv runs on its threadpool.
+//
+//     ./examples/run.sh resolve
+//
+// The lookup that blocks a thread somewhere else parks a task here, so the two names below
+// are resolved concurrently even though each `lookup` reads as if it were the only one.
+//
+// Resolution is also one of the operations `blocking` can satisfy with no loop at all, which
+// the last section shows: same call, plain libc, on main's own stack.
+
+import Local.Uv.Run.run_async, spawn_async
+import Local.Uv.Uv.UvError, uv_error_text
+import Local.Uv.Task.Runtime
+import Local.Uv.Async.Async, blocking
+import Local.Uv.Fs.resolve
+import Std.Vec.Vec, len
+
+// A number as decimal text. `String` on its own is the type's constructor, so the cast has to
+// be spelled out.
+num (v: I64): String = cast (I32 v)
+
+// One lookup, printed. `service` may be empty, or a port or service name ("80", "https").
+lookup (host: ref String) (service: ref String): Unit can Async =
+    match resolve host service
+    | Error e -> println (clone host ++ ": " ++ uv_error_text (ref e))
+    | Ok addrs ->
+        println (clone host ++ ": " ++ num (I64 addrs.len) ++ " address(es)")
+        var i = 0usz
+        while i < addrs.len do
+            println ("  " ++ clone (ptr_to_mut (offset addrs.data i)))
+            i := i + 1usz
+
+// A task carries one number, so which of the two names this one looks up travels as an index.
+host_of (n: I64): String = if n == 0 then "localhost" else "example.com"
+
+lookup_task (_rtp: Ptr Runtime) (n: I64): Unit can Async = lookup (host_of n) "https"
+
+both (rtp: Ptr Runtime): Unit can Async =
+    spawn_async rtp lookup_task 1
+    lookup_task rtp 0
+
+main () =
+    println "--- two lookups at once, on a loop ---"
+    run_async both
+
+    println ""
+    println "--- the same call under blocking: no loop, no task ---"
+    blocking fn () -> lookup "localhost" ""

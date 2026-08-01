@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# The `cc` every ante build in this tree resolves: scripts/lib.sh's ante_build prepends this
+# directory to PATH, because the ante C backend and its linker both invoke plain `cc` (no $CC).
+# This is the one seam to
+#   - downgrade -Wincompatible-pointer-types back to a warning: gcc >= 14 hard-errors it on
+#     some of the generated C,
+#   - inject per-lane flags via AUV_CC_FLAGS (e.g. "-fsanitize=address -g" for the asan lane),
+#     applied to both the compile of the generated C and the final link.
+# AUV_REAL_CC is resolved by ante_build BEFORE PATH is modified -- never resolve it here, or
+# the shim execs itself.
+
+# Phase marker (stderr): ante prints nothing between its diagnostics and the finished binary,
+# and the single-TU `cc -O3` of the generated C is the long pole -- announce which stretch
+# we're in so a live watcher can tell compile from link from hang.
+case " $* " in
+    *" -c "*) echo "ccshim: compiling generated C ($(date +%H:%M:%S))" >&2 ;;
+    *)        echo "ccshim: linking ($(date +%H:%M:%S))" >&2 ;;
+esac
+
+exec "${AUV_REAL_CC:?ccshim/cc: AUV_REAL_CC unset -- build through scripts/lib.sh ante_build}" \
+    -Wno-error=incompatible-pointer-types ${AUV_CC_FLAGS:-} "$@"

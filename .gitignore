@@ -1,0 +1,8 @@
+# Build output
+examples/build/
+examples/auv-example
+tests/uv/uv-tests
+
+# Left behind by the ante C backend and the shim compiles
+a.out.c
+*.o

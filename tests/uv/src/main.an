@@ -1,0 +1,19 @@
+import Std.C.exit
+import Local.Harness.TestState, new_state, report, failed_count
+import Local.TaskTests.run_task_tests
+import Local.SchedTests.run_sched_tests
+import Local.AsyncTests.run_async_tests
+import Local.StreamTests.run_stream_tests
+import Local.FsTests.run_fs_tests
+import Local.ProcTests.run_proc_tests
+
+main () =
+    var t = new_state ()
+    run_task_tests (mut t)
+    run_sched_tests (mut t)
+    run_async_tests (mut t)
+    run_stream_tests (mut t)
+    run_fs_tests (mut t)
+    run_proc_tests (mut t)
+    t.report ()
+    if t.failed_count () > 0 then exit 1

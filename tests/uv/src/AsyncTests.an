@@ -1,0 +1,263 @@
+// Layer 2 suite: the `Async` effect and its three handlers.
+//
+// The first test is the load-bearing one. Everything else in this file assumes a submission
+// can be performed from under an unrelated handler; `test_forwarding_park` is what proves it.
+
+import Local.Harness.TestState, ok, is_i32, is_i64, is_usz
+import Local.Uv.Uv.Completion, copy_completion, completion_none, k_timer, k_none, k_cancelled,
+    handle_null, handle_is_null, loop_thread_faults, as_i64, as_u64
+import Local.Uv.Task.Runtime, rt_new, rt_free, rt_loop, rt_live_count, rt_task_count,
+    spawn_default, run, shutdown, cancel, current_id, sleep_ms
+import Local.Uv.Async.Async, submit, Submission, copy_submission, sub_op1, op_sleep, op_none,
+    run_uv, blocking, mock, sleep, sleep_result, perform_blocking
+import Std.Vec.Vec, empty, push, len
+import Std.C.malloc, free
+// Std.Throw declares its own Result (Ok/Err), distinct from the prelude's Ok/Error;
+// `catch` returns that one, so this file matches on it.
+import Std.Throw.Throw, throw, catch, Result, Ok, Err
+
+export run_async_tests
+
+// The coroutine the effect machinery is running on, if any. A tail-resumptive handler is
+// lowered to a direct call, which leaves the handled body on the caller's own stack -- so
+// this reports "no coroutine" for a program that only ever went through `blocking`.
+mco_running = extern "mco_coro_running": fn Unit -> Ptr U8
+
+on_main_stack (): Bool = handle_is_null (mco_running ())
+
+// --- shared shapes ---------------------------------------------------------------------------
+
+type Arg =
+    rt: Ptr Runtime
+    log: Ptr (Vec I64)
+    a: I64
+    b: I64
+
+impl copy_aarg: Copy Arg with (.*) = deref
+
+arg_of (p: Ptr U8): Arg = deref_ptr (transmute p : Ptr Arg)
+
+new_log (): Ptr (Vec I64) =
+    p: Ptr (Vec I64) = malloc (size_of (MkType : Type (Vec I64)))
+    ptr_store p (Vec.empty ())
+    p
+
+log_of (p: Ptr (Vec I64)) (v: I64): Unit =
+    lg = ptr_to_mut p
+    lg.push v
+
+log_at (p: Ptr (Vec I64)) (i: Usz): I64 =
+    lg = ptr_to_mut p
+    if i >= lg.len then -1 else deref_ptr (offset lg.data i)
+
+log_len (p: Ptr (Vec I64)): Usz = (ptr_to_mut p).len
+
+free_log (p: Ptr (Vec I64)): Unit =
+    lg = ptr_to_mut p
+    if not (handle_is_null (transmute lg.data)) then free (transmute lg.data)
+    free (transmute p)
+
+new_args (n: Usz): Ptr Arg = malloc (n * size_of (MkType : Type Arg))
+arg_slot (base: Ptr Arg) (i: Usz): Ptr Arg = offset base i
+
+// --- an unrelated effect to forward through ------------------------------------------------------
+
+effect Mark =
+    mark: fn I64 -> Unit
+
+// --- the decisive test: parking from under an intermediate handler --------------------------------
+
+// Performs BOTH effects, interleaved. `mark` is handled between this body and `run_uv`, so
+// every `sleep` here has to travel out through the Mark handler to reach the Async one.
+marked_body (): I64 can Async, Mark =
+    mark 1
+    sleep 50
+    mark 2
+    sleep 50
+    mark 3
+    99
+
+forwarding_task (p: Ptr U8): Unit =
+    arg = arg_of p
+    lg = arg.log
+    r = run_uv arg.rt fn () ->
+        handler h for mark v ->
+            log_of lg v
+            resume ()
+        in marked_body ()
+    log_of lg r
+
+// Can a submission be performed, and its park survive, from inside a body that sits under a
+// handler for some other effect? If this fails, `Async` has to be a program's outermost
+// handler and everything else in this module has to say so.
+test_forwarding_park (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    args = new_args 1usz
+    ptr_store (arg_slot args 0usz) (Arg rtp lg 0 0)
+    ignore (spawn_default rtp (transmute (forwarding_task : fn (Ptr U8) -> Unit))
+                              (transmute (arg_slot args 0usz)))
+    run rtp
+
+    t.is_usz "forwarding_park: the body ran to the end" (log_len lg) 4usz
+    t.is_i64 "forwarding_park: mark 1 forwarded" (log_at lg 0usz) 1
+    t.is_i64 "forwarding_park: mark 2 forwarded after a park" (log_at lg 1usz) 2
+    t.is_i64 "forwarding_park: mark 3 forwarded after a second park" (log_at lg 2usz) 3
+    t.is_i64 "forwarding_park: the body's value came back" (log_at lg 3usz) 99
+    t.is_i64 "forwarding_park: no completion off the loop thread"
+             (loop_thread_faults (rt_loop rtp)) 0
+    shutdown rtp
+    rt_free rtp
+    free_log lg
+    free (transmute args)
+
+// --- one program, three handlers ------------------------------------------------------------------
+
+// Spawn-free and sleep-sequenced: the value it computes does not depend on what any
+// completion contains, only on the operations happening in order.
+program (): I64 can Async =
+    var acc = 1
+    sleep 10
+    acc := acc + 2
+    sleep 20
+    acc := acc + 4
+    sleep 30
+    acc * 10
+
+program_task (p: Ptr U8): Unit =
+    arg = arg_of p
+    log_of arg.log (run_uv arg.rt fn () -> program ())
+
+test_three_handlers (t: mut TestState): Unit =
+    // 1. against a real loop, on a task.
+    rtp = rt_new ()
+    lg = new_log ()
+    args = new_args 1usz
+    ptr_store (arg_slot args 0usz) (Arg rtp lg 0 0)
+    ignore (spawn_default rtp (transmute (program_task : fn (Ptr U8) -> Unit))
+                              (transmute (arg_slot args 0usz)))
+    run rtp
+    shutdown rtp
+    rt_free rtp
+
+    // 2. synchronously, with no loop and no task at all.
+    from_blocking = blocking fn () -> program ()
+
+    // 3. against a script, with no I/O at all.
+    scriptp: Ptr (Vec Completion) = malloc (size_of (MkType : Type (Vec Completion)))
+    ptr_store scriptp (Vec.empty ())
+    sc = ptr_to_mut scriptp
+    sc.push (Completion (k_timer ()) 0 0 (handle_null ()))
+    sc.push (Completion (k_timer ()) 0 0 (handle_null ()))
+    sc.push (Completion (k_timer ()) 0 0 (handle_null ()))
+    from_mock = mock scriptp fn () -> program ()
+
+    t.is_i64 "three_handlers: run_uv" (log_at lg 0usz) 70
+    t.is_i64 "three_handlers: blocking" from_blocking 70
+    t.is_i64 "three_handlers: mock" from_mock 70
+
+    if not (handle_is_null (transmute sc.data)) then free (transmute sc.data)
+    free (transmute scriptp)
+    free_log lg
+    free (transmute args)
+
+// --- the blocking handler leaves no coroutine behind --------------------------------------------------
+
+// `blocking`'s arm resumes in tail position, which the compiler lowers to a direct call. If
+// that lowering ever stopped happening, this body would find itself running on a coroutine.
+stack_probe (): Bool can Async =
+    var flat = on_main_stack ()
+    sleep 1
+    if not (on_main_stack ()) then flat := false
+    flat
+
+test_blocking_is_flat (t: mut TestState): Unit =
+    t.ok "blocking: no coroutine under a tail-resumptive handler" (blocking fn () -> stack_probe ())
+    // The control: the same probe under `mock`, which is also tail-resumptive.
+    scriptp: Ptr (Vec Completion) = malloc (size_of (MkType : Type (Vec Completion)))
+    ptr_store scriptp (Vec.empty ())
+    sc = ptr_to_mut scriptp
+    sc.push (Completion (k_timer ()) 0 0 (handle_null ()))
+    t.ok "mock: no coroutine either" (mock scriptp fn () -> stack_probe ())
+    if not (handle_is_null (transmute sc.data)) then free (transmute sc.data)
+    free (transmute scriptp)
+
+// --- row composition ------------------------------------------------------------------------------
+
+// An ordinary function that only throws, called from an async one: the two effects compose
+// on the row without either knowing about the other.
+divide (a: I64) (b: I64): I64 can Throw String =
+    if b == 0 then throw "divide by zero" else a / b
+
+// The throw happens between parks, never across one: unwinding out of a suspended frame
+// would strand the whole coroutine stack.
+guarded (n: I64): Result I64 String can Async =
+    sleep 5
+    catch fn () -> divide 100 n
+
+test_row_composition (t: mut TestState): Unit =
+    match blocking fn () -> guarded 4
+    | Ok v -> t.is_i64 "row_composition: value survives the async row" v 25
+    | Err _e -> t.ok "row_composition: value survives the async row" false
+    match blocking fn () -> guarded 0
+    | Ok _v -> t.ok "row_composition: the throw is caught inside the async row" false
+    | Err e -> t.ok "row_composition: the throw is caught inside the async row"
+                    (e.length > 0)
+
+// --- cancellation reaches the effect layer ------------------------------------------------------------
+
+// A submission whose completion is a cancellation comes back as one; nothing unwinds.
+long_sleeper (p: Ptr U8): Unit =
+    arg = arg_of p
+    finished = run_uv arg.rt fn () -> sleep_result 60000u64
+    log_of arg.log (if finished then 1 else 0)
+
+canceller (p: Ptr U8): Unit =
+    arg = arg_of p
+    ignore (sleep_ms arg.rt 50)
+    cancel arg.rt (as_u64 arg.a)
+
+test_cancel_through_effect (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    args = new_args 2usz
+    ptr_store (arg_slot args 0usz) (Arg rtp lg 0 0)
+    id = spawn_default rtp (transmute (long_sleeper : fn (Ptr U8) -> Unit))
+                           (transmute (arg_slot args 0usz))
+    ptr_store (arg_slot args 1usz) (Arg rtp lg (as_i64 id) 0)
+    ignore (spawn_default rtp (transmute (canceller : fn (Ptr U8) -> Unit))
+                              (transmute (arg_slot args 1usz)))
+    run rtp
+
+    t.is_usz "cancel_through_effect: the sleeper returned" (log_len lg) 1usz
+    t.is_i64 "cancel_through_effect: it saw a cancellation, not a timeout" (log_at lg 0usz) 0
+    shutdown rtp
+    rt_free rtp
+    free_log lg
+    free (transmute args)
+
+// --- payload sizes --------------------------------------------------------------------------------
+
+// A submission and a completion travel through the effect machinery's fixed-size argument
+// storage, which is a kilobyte. Both are flat records of scalars and pointers and must stay
+// nowhere near it.
+test_payload_sizes (t: mut TestState): Unit =
+    t.ok "payload_sizes: a submission is small"
+         (size_of (MkType : Type Submission) <= 64usz)
+    t.ok "payload_sizes: a completion is small"
+         (size_of (MkType : Type Completion) <= 64usz)
+
+// --- an op nobody implements ------------------------------------------------------------------------
+
+test_unknown_op (t: mut TestState): Unit =
+    c = perform_blocking (sub_op1 (op_none ()) 0)
+    t.is_i32 "unknown_op: an unhandled submission comes back empty" c.kind (k_none ())
+
+run_async_tests (t: mut TestState): Unit =
+    test_forwarding_park t
+    test_payload_sizes t
+    test_unknown_op t
+    test_blocking_is_flat t
+    test_three_handlers t
+    test_row_composition t
+    test_cancel_through_effect t

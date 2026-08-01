@@ -1,0 +1,222 @@
+// Layer 1 suite: the substrate a task is made of.
+//
+// A task entry is a plain `fn (Ptr U8) -> Unit` handed to `spawn` as a pointer, with its
+// argument reached through a heap record. Every suite below follows that shape: allocate the
+// per-task arguments up front, spawn, run, assert on what the tasks recorded.
+
+import Local.Harness.TestState, ok, is_i32, is_i64, is_usz
+import Local.Uv.Uv.Loop, copy_loop, Slot, copy_slot, slot_rearm, slot_deliver, Completion, copy_completion,
+    k_timer, k_async, k_cancelled, k_joined, k_none, handle_null, handle_is_null, as_i64
+import Local.Uv.Task.Runtime, rt_new, rt_free, rt_loop, rt_live_count, rt_task_count,
+    spawn, spawn_default, park, run, shutdown, current_slot, current_id, on_own_stack, set_result,
+    sleep_ms, task_sleep
+import Std.Vec.Vec, empty, push, len
+import Std.C.malloc, free
+
+export run_task_tests
+
+// --- shared shapes -------------------------------------------------------------------------------
+
+// Every task in this file takes one of these. Scalars and raw pointers only: the record is
+// read back through a pointer on the task's own stack.
+type Arg =
+    rt: Ptr Runtime
+    log: Ptr (Vec I64)
+    a: I64
+    b: I64
+
+impl copy_arg: Copy Arg with (.*) = deref
+
+arg_of (p: Ptr U8): Arg = deref_ptr (transmute p : Ptr Arg)
+
+log_push (a: Arg) (v: I64): Unit =
+    lg = ptr_to_mut a.log
+    lg.push v
+
+new_log (): Ptr (Vec I64) =
+    p: Ptr (Vec I64) = malloc (size_of (MkType : Type (Vec I64)))
+    ptr_store p (Vec.empty ())
+    p
+
+// A block of `n` argument records, so each task's argument has a stable address.
+new_args (n: Usz): Ptr Arg = malloc (n * size_of (MkType : Type Arg))
+
+arg_slot (base: Ptr Arg) (i: Usz): Ptr Arg = offset base i
+
+log_at (p: Ptr (Vec I64)) (i: Usz): I64 =
+    lg = ptr_to_mut p
+    if i >= lg.len then -1 else deref_ptr (offset lg.data i)
+
+log_len (p: Ptr (Vec I64)): Usz = (ptr_to_mut p).len
+
+free_log (p: Ptr (Vec I64)): Unit =
+    lg = ptr_to_mut p
+    if not (handle_is_null (transmute lg.data)) then free (transmute lg.data)
+    free (transmute p)
+
+// --- sleep_sorted --------------------------------------------------------------------------------
+
+// Sleep for `a` milliseconds, then record `b`.
+sleeper (p: Ptr U8): Unit =
+    arg = arg_of p
+    ignore (sleep_ms arg.rt arg.a)
+    log_push arg arg.b
+
+// Tasks that park on timers wake in duration order no matter what order they were spawned
+// in: the timer trampoline resumes each one from inside the loop turn that fired it.
+test_sleep_sorted (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    // Durations out of spawn order; each tag is the position that task should wake in.
+    var plan: Vec I64 = Vec.empty ()
+    plan.push 250
+    plan.push 5
+    plan.push 50
+    plan.push 1
+    plan.push 150
+    plan.push 3
+    plan.push 100
+    plan.push 2
+    plan.push 200
+    plan.push 4
+    n = plan.len / 2usz
+    args = new_args n
+    var i = 0usz
+    while i < n do
+        ms = deref_ptr (offset plan.data (i * 2usz))
+        tag = deref_ptr (offset plan.data (i * 2usz + 1usz))
+        ptr_store (arg_slot args i) (Arg rtp lg ms tag)
+        ignore (spawn_default rtp (transmute (sleeper : fn (Ptr U8) -> Unit))
+                                  (transmute (arg_slot args i)))
+        i := i + 1usz
+    run rtp
+
+    t.is_usz "sleep_sorted: every task woke" (log_len lg) n
+    var k = 0usz
+    var sorted = true
+    while k < log_len lg do
+        if log_at lg k != I64 (k + 1usz) then sorted := false
+        k := k + 1usz
+    t.ok "sleep_sorted: wake order is duration order" sorted
+    t.is_usz "sleep_sorted: all tasks reaped" (rt_live_count rtp) 0usz
+
+    shutdown rtp
+    rt_free rtp
+    free_log lg
+    free (transmute args)
+
+// --- the latch -----------------------------------------------------------------------------------
+
+// A completion that lands before anyone parks is not lost, and a second completion for the
+// same wait is dropped rather than resuming a task twice.
+latcher (p: Ptr U8): Unit =
+    arg = arg_of p
+    slot = current_slot arg.rt
+    slot_rearm slot
+    // Nobody is parked yet: this fills the slot.
+    slot_deliver slot (k_async ()) 11 0
+    // ... and this one loses the latch.
+    slot_deliver slot (k_async ()) 22 0
+    c = park arg.rt
+    log_push arg (I64 c.kind)
+    log_push arg c.status
+
+test_latch (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    args = new_args 1usz
+    ptr_store (arg_slot args 0usz) (Arg rtp lg 0 0)
+    ignore (spawn_default rtp (transmute (latcher : fn (Ptr U8) -> Unit))
+                              (transmute (arg_slot args 0usz)))
+    run rtp
+
+    t.is_usz "latch: park returned without suspending" (log_len lg) 2usz
+    t.is_i64 "latch: the completion survived the early delivery" (log_at lg 0usz) (I64 (k_async ()))
+    t.is_i64 "latch: the first completion won" (log_at lg 1usz) 11
+    t.is_usz "latch: task reaped" (rt_live_count rtp) 0usz
+
+    shutdown rtp
+    rt_free rtp
+    free_log lg
+    free (transmute args)
+
+// --- a task that never parks ----------------------------------------------------------------------
+
+immediate (p: Ptr U8): Unit =
+    arg = arg_of p
+    log_push arg arg.a
+
+test_immediate (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    args = new_args 1usz
+    ptr_store (arg_slot args 0usz) (Arg rtp lg 7 0)
+    id = spawn_default rtp (transmute (immediate : fn (Ptr U8) -> Unit))
+                           (transmute (arg_slot args 0usz))
+    // The body already ran: spawn resumes the new task before it returns.
+    t.is_usz "immediate: body ran inside spawn" (log_len lg) 1usz
+    t.is_i64 "immediate: body saw its argument" (log_at lg 0usz) 7
+    t.ok "immediate: ids start at 1" (id == 1u64)
+    run rtp
+    t.is_usz "immediate: reaped by the scheduler" (rt_live_count rtp) 0usz
+
+    shutdown rtp
+    rt_free rtp
+    free_log lg
+    free (transmute args)
+
+// --- on_own_stack ---------------------------------------------------------------------------------
+//
+// The question a dual-path operation has to ask -- "may I park HERE?" -- which is not the same
+// question as "am I in a task", and the case below is the whole difference. A coroutine started ON
+// a task's stack (an interpreter's, an effect handler's) still belongs to that task, so
+// `current_id` keeps naming it; but parking from there would suspend the wrong coroutine, which
+// `park` panics on. An operation that parks when it can and blocks when it cannot asks this one
+// instead.
+//
+// The externs are re-declared here rather than imported: Task.an says the same thing about its own,
+// and a nested coroutine is exactly what an embedder (the editor's Scheme VM) creates without going
+// through the shim.
+mco_resume_direct = extern "mco_coro_resume":       fn (Ptr U8) -> U8
+mco_free_direct   = extern "mco_coro_free":         fn (Ptr U8) -> U8
+mco_userdata      = extern "mco_coro_get_user_data": fn (Ptr U8) -> Ptr U8
+coro_init_sized   = extern "pc_coro_init_sized":    fn (Ptr U8) (Ptr U8) Usz -> Ptr U8
+
+nested_probe (co: Ptr U8): Unit =
+    arg = arg_of (mco_userdata co)
+    log_push arg (if on_own_stack arg.rt then 1 else 0)
+    log_push arg (as_i64 (current_id arg.rt))
+
+own_stack_probe (p: Ptr U8): Unit =
+    arg = arg_of p
+    log_push arg (if on_own_stack arg.rt then 1 else 0)
+    co = coro_init_sized (transmute (nested_probe : fn (Ptr U8) -> Unit)) p 65536usz
+    ignore (mco_resume_direct co)
+    ignore (mco_free_direct co)
+
+test_on_own_stack (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    args = new_args 1usz
+    ptr_store (arg_slot args 0usz) (Arg rtp lg 0 0)
+    t.ok "on_own_stack: false on the scheduler's own stack" (not (on_own_stack rtp))
+    ignore (spawn_default rtp (transmute (own_stack_probe : fn (Ptr U8) -> Unit))
+                              (transmute (arg_slot args 0usz)))
+    run rtp
+
+    t.is_usz "on_own_stack: the probe ran to the end" (log_len lg) 3usz
+    t.is_i64 "on_own_stack: true on the task's own stack" (log_at lg 0usz) 1
+    t.is_i64 "on_own_stack: false inside a coroutine nested on it" (log_at lg 1usz) 0
+    t.is_i64 "on_own_stack: which the task still owns all the same" (log_at lg 2usz) 1
+    t.ok "on_own_stack: false again once the task is gone" (not (on_own_stack rtp))
+
+    shutdown rtp
+    rt_free rtp
+    free_log lg
+    free (transmute args)
+
+run_task_tests (t: mut TestState): Unit =
+    test_immediate t
+    test_latch t
+    test_sleep_sorted t
+    test_on_own_stack t

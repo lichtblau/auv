@@ -1,0 +1,448 @@
+// Stream suite: an echo server and its clients, all in one process on the loopback.
+//
+// Every scenario binds to port 0 and asks the kernel which port it got, so the tests never
+// collide with each other or with anything else on the machine.
+
+import Local.Harness.TestState, ok, is_i32, is_i64, is_usz
+import Local.Uv.Uv.Completion, copy_completion, handle_is_null, loop_thread_faults,
+    loop_read_stops, UvError, uv_error_text, buf_alloc, buf_free, i32_at, socketpair_fds,
+    fd_close, as_i64
+import Local.Uv.Task.Runtime, rt_new, rt_free, rt_loop, rt_live_count, rt_task_count,
+    spawn_default, spawn, run, shutdown, cancel, sleep_ms
+import Local.Uv.Async.Async, run_uv, sleep
+import Local.Uv.Stream.Stream, copy_stream, stream_free, stream_close, stream_is_null,
+    stream_adopt_fd, stream_at_eof, stream_pending_writes,
+    Listener, copy_listener, listener_bind, listener_free, listener_port,
+    accept, connect, AsyncRead, aread, stream_async_read,
+    AsyncWrite, awrite, stream_async_write, ashutdown, read_all
+import Std.Vec.Vec, empty, push, len
+import Std.C.malloc, free
+import Std.String.eq_string
+
+export run_stream_tests
+
+// --- shared shapes ---------------------------------------------------------------------------
+
+// `port` is filled in by the server task before any client is spawned; `n` and `note` carry
+// whatever the scenario needs.
+type Ctl =
+    rt: Ptr Runtime
+    log: Ptr (Vec I64)
+    text: Ptr String
+    port: I32
+    n: I64
+    listener: Ptr Listener
+
+impl copy_ctl: Copy Ctl with (.*) = deref
+
+ctl_of (p: Ptr U8): Ctl = deref_ptr (transmute p : Ptr Ctl)
+ctl_at (p: Ptr U8): mut Ctl = ptr_to_mut (transmute p : Ptr Ctl)
+
+new_ctls (n: Usz): Ptr Ctl = malloc (n * size_of (MkType : Type Ctl))
+ctl_slot (base: Ptr Ctl) (i: Usz): Ptr Ctl = offset base i
+
+new_log (): Ptr (Vec I64) =
+    p: Ptr (Vec I64) = malloc (size_of (MkType : Type (Vec I64)))
+    ptr_store p (Vec.empty ())
+    p
+
+log_push (p: Ptr (Vec I64)) (v: I64): Unit =
+    lg = ptr_to_mut p
+    lg.push v
+
+log_at (p: Ptr (Vec I64)) (i: Usz): I64 =
+    lg = ptr_to_mut p
+    if i >= lg.len then -1 else deref_ptr (offset lg.data i)
+
+log_len (p: Ptr (Vec I64)): Usz = (ptr_to_mut p).len
+
+// Index just past the first entry equal to `marker`, or the length when there is none.
+// Tasks finish in whatever order the loop wakes them, so a scenario that wants a specific
+// task's numbers marks them rather than assuming a position.
+log_after (p: Ptr (Vec I64)) (marker: I64): Usz =
+    lg = ptr_to_mut p
+    var i = 0usz
+    var found = lg.len
+    while i < lg.len do
+        if deref_ptr (offset lg.data i) == marker then
+            found := i + 1usz
+            i := lg.len
+        else i := i + 1usz
+    found
+
+free_log (p: Ptr (Vec I64)): Unit =
+    lg = ptr_to_mut p
+    if not (handle_is_null (transmute lg.data)) then free (transmute lg.data)
+    free (transmute p)
+
+new_text (): Ptr String =
+    p: Ptr String = malloc (size_of (MkType : Type String))
+    ptr_store p ""
+    p
+
+text_set (p: Ptr String) (s: String): Unit = ptr_store p s
+text_get (p: Ptr String): String = clone (ptr_to_mut p)
+
+new_listener_cell (): Ptr Listener = malloc (size_of (MkType : Type Listener))
+
+// --- echo server ---------------------------------------------------------------------------------
+
+// One connection: read until the peer half-closes, echo every chunk straight back.
+echo_conn (p: Ptr U8): Unit =
+    ctl = ctl_of p
+    sp: Ptr Stream = transmute ctl.listener      // this task's argument is its own stream cell
+    run_uv ctl.rt fn () ->
+        s = deref_ptr sp
+        var going = true
+        while going do
+            match aread s
+            | Ok (Some chunk) ->
+                match awrite s chunk
+                | Ok _ -> ()
+                | Error _e -> going := false
+            | Ok None -> going := false
+            | Error _e -> going := false
+        ignore (ashutdown s)
+        stream_free s
+        log_push ctl.log 1
+
+// Accept `n` connections, handing each to its own task.
+echo_server (p: Ptr U8): Unit =
+    ctl = ctl_of p
+    run_uv ctl.rt fn () ->
+        var left = ctl.n
+        while left > 0 do
+            match accept ctl.rt (ptr_to_mut ctl.listener)
+            | Ok s ->
+                cell: Ptr Stream = malloc (size_of (MkType : Type Stream))
+                ptr_store cell s
+                kid: Ptr Ctl = malloc (size_of (MkType : Type Ctl))
+                ptr_store kid (Ctl ctl.rt ctl.log ctl.text 0 0 (transmute cell))
+                ignore (spawn_default ctl.rt (transmute (echo_conn : fn (Ptr U8) -> Unit))
+                                             (transmute kid))
+                left := left - 1
+            | Error _e -> left := 0
+
+// Connect, send a greeting, half-close, read the echo back.
+echo_client (p: Ptr U8): Unit =
+    ctl = ctl_of p
+    run_uv ctl.rt fn () ->
+        match connect ctl.rt "127.0.0.1" ctl.port
+        | Error _e -> log_push ctl.log -1
+        | Ok s ->
+            msg = "hello stream"
+            match awrite s msg
+            | Error _e -> log_push ctl.log -2
+            | Ok _ ->
+                ignore (ashutdown s)
+                match read_all s
+                | Ok back ->
+                    log_push ctl.log (if back == msg then 10 else -3)
+                | Error _e -> log_push ctl.log -4
+            stream_free s
+
+test_echo (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    txt = new_text ()
+    lp = new_listener_cell ()
+    clients = 4usz
+
+    match listener_bind rtp "127.0.0.1" 0 16
+    | Error e ->
+        t.ok ("echo: bind failed: " ++ uv_error_text (ref e)) false
+    | Ok l ->
+        ptr_store lp l
+        port = listener_port (ptr_to_mut lp)
+        t.ok "echo: the kernel picked a port" (port > 0)
+        ctls = new_ctls (clients + 1usz)
+        ptr_store (ctl_slot ctls 0usz) (Ctl rtp lg txt port (I64 clients) lp)
+        ignore (spawn_default rtp (transmute (echo_server : fn (Ptr U8) -> Unit))
+                                  (transmute (ctl_slot ctls 0usz)))
+        var i = 0usz
+        while i < clients do
+            ptr_store (ctl_slot ctls (i + 1usz)) (Ctl rtp lg txt port 0 lp)
+            ignore (spawn_default rtp (transmute (echo_client : fn (Ptr U8) -> Unit))
+                                      (transmute (ctl_slot ctls (i + 1usz))))
+            i := i + 1usz
+        run rtp
+
+        var echoed = 0usz
+        var served = 0usz
+        var k = 0usz
+        while k < log_len lg do
+            if log_at lg k == 10 then echoed := echoed + 1usz
+            if log_at lg k == 1 then served := served + 1usz
+            k := k + 1usz
+        t.is_usz "echo: every client got its bytes back" echoed clients
+        t.is_usz "echo: every connection was served" served clients
+        t.is_i64 "echo: no completion off the loop thread" (loop_thread_faults (rt_loop rtp)) 0
+        listener_free (deref_ptr lp)
+        free (transmute ctls)
+
+    shutdown rtp
+    rt_free rtp
+    free_log lg
+    free (transmute txt)
+    free (transmute lp)
+
+// --- a transfer larger than any pipe buffer -------------------------------------------------------
+
+// Send a quarter of a megabyte in one call. The kernel cannot take it all at once, so the
+// write parks until libuv has drained the rest.
+big_client (p: Ptr U8): Unit =
+    ctl = ctl_of p
+    run_uv ctl.rt fn () ->
+        match connect ctl.rt "127.0.0.1" ctl.port
+        | Error _e -> log_push ctl.log -1
+        | Ok s ->
+            var payload = ""
+            var i = 0
+            while i < 4096 do
+                payload := payload ++ "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                i := i + 1
+            want = Usz payload.length
+            match awrite s payload
+            | Error _e -> log_push ctl.log -2
+            | Ok _ ->
+                ignore (ashutdown s)
+                match read_all s
+                | Ok back ->
+                    log_push ctl.log 777
+                    log_push ctl.log (as_i64 (U64 (Usz back.length)))
+                    log_push ctl.log (as_i64 (U64 want))
+                | Error _e -> log_push ctl.log -4
+            stream_free s
+
+test_large_transfer (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    txt = new_text ()
+    lp = new_listener_cell ()
+
+    match listener_bind rtp "127.0.0.1" 0 8
+    | Error e -> t.ok ("large_transfer: bind failed: " ++ uv_error_text (ref e)) false
+    | Ok l ->
+        ptr_store lp l
+        port = listener_port (ptr_to_mut lp)
+        ctls = new_ctls 2usz
+        ptr_store (ctl_slot ctls 0usz) (Ctl rtp lg txt port 1 lp)
+        ignore (spawn_default rtp (transmute (echo_server : fn (Ptr U8) -> Unit))
+                                  (transmute (ctl_slot ctls 0usz)))
+        ptr_store (ctl_slot ctls 1usz) (Ctl rtp lg txt port 0 lp)
+        ignore (spawn_default rtp (transmute (big_client : fn (Ptr U8) -> Unit))
+                                  (transmute (ctl_slot ctls 1usz)))
+        run rtp
+
+        at = log_after lg 777
+        t.ok "large_transfer: the client reported a length" (at + 1usz < log_len lg)
+        t.is_i64 "large_transfer: everything came back" (log_at lg at) (log_at lg (at + 1usz))
+        t.ok "large_transfer: it really was large" (log_at lg (at + 1usz) > 200000)
+        listener_free (deref_ptr lp)
+        free (transmute ctls)
+
+    shutdown rtp
+    rt_free rtp
+    free_log lg
+    free (transmute txt)
+    free (transmute lp)
+
+// --- backpressure ----------------------------------------------------------------------------------
+
+// Read one chunk, then dawdle. Every chunk that arrives while this task is off sleeping finds
+// no reader parked, so the shim stops reading -- which is the backpressure.
+slow_reader (p: Ptr U8): Unit =
+    ctl = ctl_of p
+    sp: Ptr Stream = transmute ctl.listener
+    run_uv ctl.rt fn () ->
+        s = deref_ptr sp
+        var total = 0
+        var going = true
+        while going do
+            match aread s
+            | Ok (Some chunk) ->
+                total := total + as_i64 (U64 (Usz chunk.length))
+                sleep 20u64
+            | Ok None -> going := false
+            | Error _e -> going := false
+        log_push ctl.log 999
+        log_push ctl.log total
+        stream_free s
+
+flood_server (p: Ptr U8): Unit =
+    ctl = ctl_of p
+    run_uv ctl.rt fn () ->
+        match accept ctl.rt (ptr_to_mut ctl.listener)
+        | Error _e -> log_push ctl.log -1
+        | Ok cs ->
+            cell: Ptr Stream = malloc (size_of (MkType : Type Stream))
+            ptr_store cell cs
+            kid: Ptr Ctl = malloc (size_of (MkType : Type Ctl))
+            ptr_store kid (Ctl ctl.rt ctl.log ctl.text 0 0 (transmute cell))
+            ignore (spawn_default ctl.rt (transmute (slow_reader : fn (Ptr U8) -> Unit))
+                                         (transmute kid))
+
+flood_client (p: Ptr U8): Unit =
+    ctl = ctl_of p
+    run_uv ctl.rt fn () ->
+        match connect ctl.rt "127.0.0.1" ctl.port
+        | Error _e -> log_push ctl.log -1
+        | Ok s ->
+            var payload = ""
+            var i = 0
+            while i < 2048 do
+                payload := payload ++ "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                i := i + 1
+            log_push ctl.log 888
+            log_push ctl.log (as_i64 (U64 (Usz payload.length)))
+            ignore (awrite s payload)
+            ignore (ashutdown s)
+            // Wait for the peer to finish before tearing the connection down.
+            match read_all s
+            | Ok _ -> ()
+            | Error _e -> ()
+            stream_free s
+
+test_backpressure (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    txt = new_text ()
+    lp = new_listener_cell ()
+
+    match listener_bind rtp "127.0.0.1" 0 8
+    | Error e -> t.ok ("backpressure: bind failed: " ++ uv_error_text (ref e)) false
+    | Ok l ->
+        ptr_store lp l
+        port = listener_port (ptr_to_mut lp)
+        ctls = new_ctls 2usz
+        ptr_store (ctl_slot ctls 0usz) (Ctl rtp lg txt port 1 lp)
+        ignore (spawn_default rtp (transmute (flood_server : fn (Ptr U8) -> Unit))
+                                  (transmute (ctl_slot ctls 0usz)))
+        ptr_store (ctl_slot ctls 1usz) (Ctl rtp lg txt port 0 lp)
+        ignore (spawn_default rtp (transmute (flood_client : fn (Ptr U8) -> Unit))
+                                  (transmute (ctl_slot ctls 1usz)))
+        run rtp
+
+        sent = log_at lg (log_after lg 888)
+        got = log_at lg (log_after lg 999)
+        t.is_i64 "backpressure: the reader got everything, slowly" got sent
+        t.ok "backpressure: reading was stopped while the reader dawdled"
+             (loop_read_stops (rt_loop rtp) > 0)
+        listener_free (deref_ptr lp)
+        free (transmute ctls)
+
+    shutdown rtp
+    rt_free rtp
+    free_log lg
+    free (transmute txt)
+    free (transmute lp)
+
+// --- a client that disappears mid-transfer ------------------------------------------------------------
+
+// Say hello, then vanish without half-closing. The server's reader must see end of file and
+// its task must finish rather than sit parked forever.
+rude_client (p: Ptr U8): Unit =
+    ctl = ctl_of p
+    run_uv ctl.rt fn () ->
+        match connect ctl.rt "127.0.0.1" ctl.port
+        | Error _e -> log_push ctl.log -1
+        | Ok s ->
+            ignore (awrite s "half a message")
+            sleep 30u64
+            stream_free s
+            log_push ctl.log 2
+
+test_client_vanishes (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    txt = new_text ()
+    lp = new_listener_cell ()
+
+    match listener_bind rtp "127.0.0.1" 0 8
+    | Error e -> t.ok ("client_vanishes: bind failed: " ++ uv_error_text (ref e)) false
+    | Ok l ->
+        ptr_store lp l
+        port = listener_port (ptr_to_mut lp)
+        ctls = new_ctls 2usz
+        ptr_store (ctl_slot ctls 0usz) (Ctl rtp lg txt port 1 lp)
+        ignore (spawn_default rtp (transmute (echo_server : fn (Ptr U8) -> Unit))
+                                  (transmute (ctl_slot ctls 0usz)))
+        ptr_store (ctl_slot ctls 1usz) (Ctl rtp lg txt port 0 lp)
+        ignore (spawn_default rtp (transmute (rude_client : fn (Ptr U8) -> Unit))
+                                  (transmute (ctl_slot ctls 1usz)))
+        run rtp
+
+        t.is_usz "client_vanishes: nothing is left parked" (rt_live_count rtp) 0usz
+        var served = false
+        var k = 0usz
+        while k < log_len lg do
+            if log_at lg k == 1 then served := true
+            k := k + 1usz
+        t.ok "client_vanishes: the server's connection task finished" served
+        listener_free (deref_ptr lp)
+        free (transmute ctls)
+
+    shutdown rtp
+    rt_free rtp
+    free_log lg
+    free (transmute txt)
+    free (transmute lp)
+
+// --- close while a reader is parked ---------------------------------------------------------------------
+
+// Park on a socketpair end that nobody writes to, and have a sibling close it.
+adopt_reader (p: Ptr U8): Unit =
+    ctl = ctl_of p
+    sp: Ptr Stream = transmute ctl.listener
+    run_uv ctl.rt fn () ->
+        match aread (deref_ptr sp)
+        | Ok None -> log_push ctl.log 100
+        | Ok (Some _c) -> log_push ctl.log -100
+        | Error _e -> log_push ctl.log -101
+
+adopt_closer (p: Ptr U8): Unit =
+    ctl = ctl_of p
+    sp: Ptr Stream = transmute ctl.listener
+    ignore (sleep_ms ctl.rt 50)
+    stream_close (deref_ptr sp)
+
+test_close_while_reading (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    txt = new_text ()
+    fds = buf_alloc 8usz
+    t.is_i32 "close_while_reading: socketpair created" (socketpair_fds fds) 0
+    a = i32_at fds 0usz
+    b = i32_at fds 1usz
+
+    cell: Ptr Stream = malloc (size_of (MkType : Type Stream))
+    ptr_store cell (stream_adopt_fd rtp a)
+    ctls = new_ctls 2usz
+    ptr_store (ctl_slot ctls 0usz) (Ctl rtp lg txt 0 0 (transmute cell))
+    ptr_store (ctl_slot ctls 1usz) (Ctl rtp lg txt 0 0 (transmute cell))
+    ignore (spawn_default rtp (transmute (adopt_reader : fn (Ptr U8) -> Unit))
+                              (transmute (ctl_slot ctls 0usz)))
+    ignore (spawn_default rtp (transmute (adopt_closer : fn (Ptr U8) -> Unit))
+                              (transmute (ctl_slot ctls 1usz)))
+    run rtp
+
+    t.is_usz "close_while_reading: the reader woke" (log_len lg) 1usz
+    t.is_i64 "close_while_reading: it saw end of file" (log_at lg 0usz) 100
+    t.is_usz "close_while_reading: nothing left parked" (rt_live_count rtp) 0usz
+
+    stream_free (deref_ptr cell)
+    shutdown rtp
+    rt_free rtp
+    ignore (fd_close b)
+    free (transmute cell)
+    free (transmute ctls)
+    free_log lg
+    free (transmute txt)
+    buf_free fds
+
+run_stream_tests (t: mut TestState): Unit =
+    test_close_while_reading t
+    test_echo t
+    test_large_transfer t
+    test_client_vanishes t
+    test_backpressure t

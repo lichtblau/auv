@@ -1,0 +1,15 @@
+// The examples project's default entry point: a list of what is here.
+//
+// Every example is a file of its own under src/, each with its own `main`, and
+// `./examples/run.sh <name>` picks one out with the compiler's `--bin` flag. This is the one
+// you get when no name is given.
+
+main () =
+    println "auv examples -- run one with:  ./examples/run.sh <name>"
+    println ""
+    println "  timers            three tasks on three schedules, one loop"
+    println "  tcp-echo-server   an echo server, one task per connection"
+    println "  tcp-echo-client   three clients against it at once"
+    println "  fs-basic          mkdir / write / stat / read / list, with and without a loop"
+    println "  spawn-child       a child process: both pipes and the exit status"
+    println "  resolve           getaddrinfo, concurrently and then synchronously"

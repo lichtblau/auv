@@ -1,0 +1,479 @@
+// Filesystem and name-resolution suite.
+//
+// These are the operations libuv runs on its threadpool, so this file is also the proof that
+// no coroutine is ever touched from a worker thread: every scenario checks the shim's
+// off-loop-thread counter, and the storm below saturates the pool while doing it.
+//
+// Each scenario works inside a directory of its own named after the process, so two copies of
+// the suite running at once cannot collide.
+
+import Local.Harness.TestState, ok, is_i32, is_i64, is_usz
+import Local.Uv.Uv.Completion, copy_completion, handle_is_null, loop_thread_faults,
+    getpid, as_i64, UvError, uv_error_text
+import Local.Uv.Task.Runtime, rt_new, rt_free, rt_loop, rt_live_count,
+    spawn, spawn_default, join, run, shutdown
+import Local.Uv.Async.Async, run_uv, blocking, sleep
+import Local.Uv.Fs.FileInfo, copy_fileinfo, fi_size, fi_is_dir,
+    fs_open, fs_read, fs_write, fs_close, fs_stat, fs_scandir,
+    fs_mkdir, fs_rmdir, fs_unlink, fs_rename, read_file, write_file, resolve,
+    DirEntry, fs_scandir_entries,
+    o_rdonly, o_wronly, o_creat, o_trunc
+import Std.Vec.Vec, empty, push, len
+import Std.C.malloc, free
+import Std.String.eq_string
+
+export run_fs_tests
+
+// --- shared shapes ---------------------------------------------------------------------------
+
+type FArg =
+    rt: Ptr Runtime
+    log: Ptr (Vec I64)
+    dir: Ptr String
+    n: I64
+
+impl copy_farg: Copy FArg with (.*) = deref
+
+farg_of (p: Ptr U8): FArg = deref_ptr (transmute p : Ptr FArg)
+
+new_fargs (n: Usz): Ptr FArg = malloc (n * size_of (MkType : Type FArg))
+farg_slot (base: Ptr FArg) (i: Usz): Ptr FArg = offset base i
+
+new_log (): Ptr (Vec I64) =
+    p: Ptr (Vec I64) = malloc (size_of (MkType : Type (Vec I64)))
+    ptr_store p (Vec.empty ())
+    p
+
+log_push (p: Ptr (Vec I64)) (v: I64): Unit =
+    lg = ptr_to_mut p
+    lg.push v
+
+log_at (p: Ptr (Vec I64)) (i: Usz): I64 =
+    lg = ptr_to_mut p
+    if i >= lg.len then -1 else deref_ptr (offset lg.data i)
+
+log_len (p: Ptr (Vec I64)): Usz = (ptr_to_mut p).len
+
+log_count (p: Ptr (Vec I64)) (v: I64): Usz =
+    lg = ptr_to_mut p
+    var n = 0usz
+    var i = 0usz
+    while i < lg.len do
+        if deref_ptr (offset lg.data i) == v then n := n + 1usz
+        i := i + 1usz
+    n
+
+// A String out of a vector, by clone.
+//
+// `deref_ptr` on a `Ptr String` hands back an OWNED string without touching the reference
+// count, so consuming it -- comparing it, printing it, passing it by value -- drops the
+// vector's own element out from under the vector. Cloning takes the reference the copy needs.
+str_at (v: ref Vec String) (i: Usz): String = clone (ptr_to_mut (offset v.data i))
+
+free_log (p: Ptr (Vec I64)): Unit =
+    lg = ptr_to_mut p
+    if not (handle_is_null (transmute lg.data)) then free (transmute lg.data)
+    free (transmute p)
+
+new_dir_cell (): Ptr String =
+    p: Ptr String = malloc (size_of (MkType : Type String))
+    ptr_store p "/tmp/uv-lane-${getpid ()}"
+    p
+
+dir_of (p: Ptr String): String = clone (ptr_to_mut p)
+
+// Every scenario builds its paths from the shared directory cell.
+path_in (dir: Ptr String) (name: String): String = dir_of dir ++ "/" ++ name
+
+// --- round trip ------------------------------------------------------------------------------
+
+// Create a directory, write a file, stat it, read it back, rename it, remove everything.
+round_trip (p: Ptr U8): Unit =
+    arg = farg_of p
+    run_uv arg.rt fn () ->
+        dir = dir_of arg.dir
+        ignore (fs_rmdir dir)
+        match fs_mkdir dir 493            // 0755
+        | Error _e -> log_push arg.log -1
+        | Ok _u ->
+            body = "the quick brown fox jumps over the lazy dog\n"
+            first = path_in arg.dir "one.txt"
+            second = path_in arg.dir "two.txt"
+            match write_file first body
+            | Error _e -> log_push arg.log -2
+            | Ok _u ->
+                match fs_stat first
+                | Error _e -> log_push arg.log -3
+                | Ok info ->
+                    log_push arg.log (fi_size info)
+                    log_push arg.log (if fi_is_dir info then 1 else 0)
+                match read_file first
+                | Error _e -> log_push arg.log -4
+                | Ok back -> log_push arg.log (if back == clone body then 1 else 0)
+                match fs_rename first second
+                | Error _e -> log_push arg.log -5
+                | Ok _u ->
+                    match fs_stat first
+                    | Ok _i -> log_push arg.log -6      // the old name should be gone
+                    | Error _e -> log_push arg.log 1
+                    match read_file second
+                    | Ok back2 -> log_push arg.log (if back2 == body then 1 else 0)
+                    | Error _e -> log_push arg.log -7
+                    ignore (fs_unlink second)
+        match fs_stat dir
+        | Ok info -> log_push arg.log (if fi_is_dir info then 1 else 0)
+        | Error _e -> log_push arg.log -8
+        ignore (fs_rmdir dir)
+
+test_round_trip (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    dir = new_dir_cell ()
+    args = new_fargs 1usz
+    ptr_store (farg_slot args 0usz) (FArg rtp lg dir 0)
+    ignore (spawn_default rtp (transmute (round_trip : fn (Ptr U8) -> Unit))
+                              (transmute (farg_slot args 0usz)))
+    run rtp
+
+    t.is_usz "round_trip: every step reported" (log_len lg) 6usz
+    t.is_i64 "round_trip: stat saw the whole file" (log_at lg 0usz) 44
+    t.is_i64 "round_trip: a file is not a directory" (log_at lg 1usz) 0
+    t.is_i64 "round_trip: read gave back what was written" (log_at lg 2usz) 1
+    t.is_i64 "round_trip: the old name is gone after a rename" (log_at lg 3usz) 1
+    t.is_i64 "round_trip: the new name has the same bytes" (log_at lg 4usz) 1
+    t.is_i64 "round_trip: the directory is a directory" (log_at lg 5usz) 1
+    t.is_i64 "round_trip: no completion off the loop thread" (loop_thread_faults (rt_loop rtp)) 0
+
+    shutdown rtp
+    rt_free rtp
+    free_log lg
+    free (transmute dir)
+    free (transmute args)
+
+// --- scandir ---------------------------------------------------------------------------------
+
+// Create a known set of files and check the directory listing is exactly that set. Comparing
+// against a fixed expectation rather than another tool's output keeps the check hermetic.
+scan_task (p: Ptr U8): Unit =
+    arg = farg_of p
+    run_uv arg.rt fn () ->
+        dir = dir_of arg.dir
+        ignore (fs_rmdir dir)
+        ignore (fs_mkdir dir 493)
+        names: Vec String = Vec.empty ()
+        var mk = names
+        mk.push "alpha"
+        mk.push "beta"
+        mk.push "gamma"
+        mk.push "delta"
+        var i = 0usz
+        while i < mk.len do
+            ignore (write_file (path_in arg.dir (str_at (ref mk) i)) "x")
+            i := i + 1usz
+        match fs_scandir dir
+        | Error _e -> log_push arg.log -1
+        | Ok found ->
+            log_push arg.log (as_i64 (U64 found.len))
+            // Every created name must appear exactly once.
+            var all = 0
+            var k = 0usz
+            while k < mk.len do
+                var seen = 0
+                var j = 0usz
+                while j < found.len do
+                    if str_at (ref found) j == str_at (ref mk) k then seen := seen + 1
+                    j := j + 1usz
+                if seen == 1 then all := all + 1
+                k := k + 1usz
+            log_push arg.log (I64 all)
+        i := 0usz
+        while i < mk.len do
+            ignore (fs_unlink (path_in arg.dir (str_at (ref mk) i)))
+            i := i + 1usz
+        ignore (fs_rmdir dir)
+
+test_scandir (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    dir = new_dir_cell ()
+    args = new_fargs 1usz
+    ptr_store (farg_slot args 0usz) (FArg rtp lg dir 0)
+    ignore (spawn_default rtp (transmute (scan_task : fn (Ptr U8) -> Unit))
+                              (transmute (farg_slot args 0usz)))
+    run rtp
+
+    t.is_i64 "scandir: found exactly the files created" (log_at lg 0usz) 4
+    t.is_i64 "scandir: each of them once" (log_at lg 1usz) 4
+    t.is_i64 "scandir: no completion off the loop thread" (loop_thread_faults (rt_loop rtp)) 0
+
+    shutdown rtp
+    rt_free rtp
+    free_log lg
+    free (transmute dir)
+    free (transmute args)
+
+// --- the threadpool storm -----------------------------------------------------------------------
+
+// One file per task, written and read back. libuv's threadpool is four workers by default, so
+// two hundred of these keep it saturated for the whole run -- and every completion still has
+// to arrive on the loop thread.
+storm_child (p: Ptr U8): Unit =
+    arg = farg_of p
+    run_uv arg.rt fn () ->
+        name = path_in arg.dir "f${I32 arg.n}"
+        body = "storm ${I32 arg.n}\n"
+        match write_file name body
+        | Error _e -> log_push arg.log -1
+        | Ok _u ->
+            match read_file name
+            | Ok back -> log_push arg.log (if back == body then 1 else -2)
+            | Error _e -> log_push arg.log -3
+        ignore (fs_unlink name)
+
+storm_root (p: Ptr U8): Unit =
+    arg = farg_of p
+    n = Usz arg.n
+    run_uv arg.rt fn () ->
+        ignore (fs_rmdir (dir_of arg.dir))
+        ignore (fs_mkdir (dir_of arg.dir) 493)
+    kids = new_fargs n
+    var ids: Vec U64 = Vec.empty ()
+    var i = 0usz
+    while i < n do
+        ptr_store (farg_slot kids i) (FArg arg.rt arg.log arg.dir (as_i64 (U64 i)))
+        ids.push (spawn arg.rt (transmute (storm_child : fn (Ptr U8) -> Unit))
+                               (transmute (farg_slot kids i)) 65536usz)
+        i := i + 1usz
+    i := 0usz
+    while i < n do
+        ignore (join arg.rt (deref_ptr (offset ids.data i)))
+        i := i + 1usz
+    run_uv arg.rt fn () -> ignore (fs_rmdir (dir_of arg.dir))
+    free (transmute kids)
+    if not (handle_is_null (transmute ids.data)) then free (transmute ids.data)
+
+test_fs_storm (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    dir = new_dir_cell ()
+    n = 200usz
+    args = new_fargs 1usz
+    ptr_store (farg_slot args 0usz) (FArg rtp lg dir (as_i64 (U64 n)))
+    ignore (spawn_default rtp (transmute (storm_root : fn (Ptr U8) -> Unit))
+                              (transmute (farg_slot args 0usz)))
+    run rtp
+
+    t.is_usz "fs_storm: every task reported" (log_len lg) n
+    t.is_usz "fs_storm: every file round-tripped" (log_count lg 1) n
+    t.is_i64 "fs_storm: no completion off the loop thread, under a saturated threadpool"
+             (loop_thread_faults (rt_loop rtp)) 0
+    t.is_usz "fs_storm: everything reaped" (rt_live_count rtp) 0usz
+
+    shutdown rtp
+    rt_free rtp
+    free_log lg
+    free (transmute dir)
+    free (transmute args)
+
+// --- name resolution -----------------------------------------------------------------------------
+
+resolve_task (p: Ptr U8): Unit =
+    arg = farg_of p
+    run_uv arg.rt fn () ->
+        match resolve "localhost" ""
+        | Error _e -> log_push arg.log -1
+        | Ok addrs ->
+            log_push arg.log (as_i64 (U64 addrs.len))
+            var loopback = 0
+            var i = 0usz
+            while i < addrs.len do
+                // A fresh clone per comparison: `==` consumes its arguments.
+                if str_at (ref addrs) i == "127.0.0.1" or str_at (ref addrs) i == "::1" then
+                    loopback := loopback + 1
+                i := i + 1usz
+            log_push arg.log (I64 loopback)
+
+test_resolve (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    dir = new_dir_cell ()
+    args = new_fargs 1usz
+    ptr_store (farg_slot args 0usz) (FArg rtp lg dir 0)
+    ignore (spawn_default rtp (transmute (resolve_task : fn (Ptr U8) -> Unit))
+                              (transmute (farg_slot args 0usz)))
+    run rtp
+
+    t.ok "resolve: localhost resolved to something" (log_at lg 0usz > 0)
+    t.ok "resolve: and it was the loopback" (log_at lg 1usz > 0)
+    t.is_i64 "resolve: no completion off the loop thread" (loop_thread_faults (rt_loop rtp)) 0
+
+    shutdown rtp
+    rt_free rtp
+    free_log lg
+    free (transmute dir)
+    free (transmute args)
+
+// --- the same program without a loop ----------------------------------------------------------------
+
+// The filesystem operations are ordinary `Async` submissions, so they run under `blocking`
+// too: same code, plain libc underneath, no loop and no task.
+test_fs_blocking (t: mut TestState): Unit =
+    dir = new_dir_cell ()
+    d = dir_of dir
+    name = d ++ "/blocking.txt"
+    body = "no loop was harmed\n"
+    ok_write = blocking fn () ->
+        ignore (fs_rmdir d)
+        ignore (fs_mkdir d 493)
+        match write_file name body
+        | Ok _u -> true
+        | Error _e -> false
+    t.ok "fs_blocking: wrote the file with no loop" ok_write
+    same = blocking fn () ->
+        r = match read_file name
+            | Ok back -> back == body
+            | Error _e -> false
+        ignore (fs_unlink name)
+        ignore (fs_rmdir d)
+        r
+    t.ok "fs_blocking: read it back the same" same
+    free (transmute dir)
+
+// --- scandir carries the entry TYPE ------------------------------------------------------------------
+
+// `readdir` already knows whether an entry is a directory, and the shim now marshals that alongside
+// the name. It is the difference between listing a directory in one round trip and following it
+// with a `stat` per entry, so it is worth a test of its own -- under BOTH handlers, because the two
+// arms read the type from different places (uv_dirent_t.type on the loop path, struct dirent.d_type
+// in the synchronous twin) and could drift apart without one.
+//
+// Encoded as one integer per property so the check reads the same under both handlers:
+//   0 = the subdirectory was reported as a directory
+//   1 = the regular file was reported as NOT a directory
+//   2 = both types were KNOWN (this is ext4/tmpfs; a filesystem without d_type would say 0 here,
+//       which is why the caller-side fallback exists rather than being an assertion)
+scandir_types_probe (dir: Ptr String): I64 can Async =
+    d = dir_of dir
+    ignore (fs_rmdir d)
+    ignore (fs_mkdir d 493)
+    sub = path_in dir "a-subdir"
+    reg = path_in dir "a-file"
+    ignore (fs_mkdir sub 493)
+    ignore (write_file reg "x")
+    var score = 0
+    ents = fs_scandir_entries d
+    var i = 0usz
+    while i < ents.len do
+        e = ptr_to_mut (offset ents.data i)
+        nm = clone e.name
+        if nm == "a-subdir" and e.is_dir then score := score + 1
+        if nm == "a-file" and not e.is_dir then score := score + 2
+        if e.known then score := score + 4
+        i := i + 1usz
+    ignore (fs_unlink (path_in dir "a-file"))
+    ignore (fs_rmdir (path_in dir "a-subdir"))
+    ignore (fs_rmdir d)
+    score
+
+scandir_types_task (p: Ptr U8): Unit =
+    arg = farg_of p
+    log_push arg.log (run_uv arg.rt fn () -> scandir_types_probe arg.dir)
+
+// 1 (subdir is a dir) + 2 (file is not) + 4 + 4 (both known) = 11.
+scandir_types_expected (): I64 = 11
+
+test_scandir_types (t: mut TestState): Unit =
+    dir = new_dir_cell ()
+    t.is_i64 "scandir_types: blocking reports dir vs file"
+             (blocking fn () -> scandir_types_probe dir) (scandir_types_expected ())
+
+    rtp = rt_new ()
+    lg = new_log ()
+    args = new_fargs 1usz
+    ptr_store (farg_slot args 0usz) (FArg rtp lg dir 0)
+    ignore (spawn_default rtp (transmute (scandir_types_task : fn (Ptr U8) -> Unit))
+                              (transmute (farg_slot args 0usz)))
+    run rtp
+    t.is_i64 "scandir_types: the loop path agrees" (log_at lg 0usz) (scandir_types_expected ())
+    t.is_i64 "scandir_types: no completion off the loop thread"
+             (loop_thread_faults (rt_loop rtp)) 0
+
+    shutdown rtp
+    rt_free rtp
+    free_log lg
+    free (transmute args)
+    free (transmute dir)
+
+// --- the offset that means "wherever the file position is" -------------------------------------------
+
+// A negative offset is uv_fs_read/uv_fs_write's way of saying "use read(2)/write(2), not
+// pread/pwrite" -- and the only thing a FIFO, a pipe or a character device can be given, since
+// those cannot seek. It is what pc's parked whole-file reader passes on every chunk.
+//
+// The loop path always honoured it, because libuv does. The `blocking` arm did not: it called
+// pread/pwrite unconditionally and a negative offset came back EINVAL, so the "same program
+// under all three handlers" promise held for every offset except the one an unseekable file
+// has. This is the twin property, checked from both sides.
+at_position (): I64 = 0i64 - 1i64
+
+cp_body (): String = "written where the file position was\n"
+
+current_position_probe (dir: Ptr String): Bool can Async =
+    d = dir_of dir
+    ignore (fs_mkdir d 493)                    // 0755
+    name = path_in dir "seqpos.txt"
+    var wrote = false
+    match fs_open name (o_wronly () + o_creat () + o_trunc ()) 420          // 0644
+    | Error _e -> ()
+    | Ok fd ->
+        match fs_write fd (cp_body ()) (at_position ())
+        | Ok n -> wrote := n == as_i64 (U64 (Usz (cp_body ()).length))
+        | Error _e -> ()
+        ignore (fs_close fd)
+    var same = false
+    match fs_open name (o_rdonly ()) 0
+    | Error _e -> ()
+    | Ok fd ->
+        match fs_read fd 4096usz (at_position ())
+        | Ok back -> same := back == cp_body ()
+        | Error _e -> ()
+        ignore (fs_close fd)
+    ignore (fs_unlink name)
+    ignore (fs_rmdir d)
+    wrote and same
+
+current_position_task (p: Ptr U8): Unit =
+    arg = farg_of p
+    r = run_uv arg.rt fn () -> current_position_probe arg.dir
+    log_push arg.log (if r then 1 else 0)
+
+test_fs_current_position (t: mut TestState): Unit =
+    dir = new_dir_cell ()
+    t.ok "fs_current_position: blocking reads and writes at the file position"
+         (blocking fn () -> current_position_probe dir)
+
+    rtp = rt_new ()
+    lg = new_log ()
+    args = new_fargs 1usz
+    ptr_store (farg_slot args 0usz) (FArg rtp lg dir 0)
+    ignore (spawn_default rtp (transmute (current_position_task : fn (Ptr U8) -> Unit))
+                              (transmute (farg_slot args 0usz)))
+    run rtp
+    t.is_i64 "fs_current_position: the loop path answers the same" (log_at lg 0usz) 1
+    t.is_i64 "fs_current_position: no completion off the loop thread"
+             (loop_thread_faults (rt_loop rtp)) 0
+
+    shutdown rtp
+    rt_free rtp
+    free_log lg
+    free (transmute args)
+    free (transmute dir)
+
+run_fs_tests (t: mut TestState): Unit =
+    test_round_trip t
+    test_scandir t
+    test_scandir_types t
+    test_resolve t
+    test_fs_blocking t
+    test_fs_current_position t
+    test_fs_storm t

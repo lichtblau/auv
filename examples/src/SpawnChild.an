@@ -1,0 +1,83 @@
+// Child processes: pipes in both directions, and an exit status that waits to be collected.
+//
+//     ./examples/run.sh spawn-child
+//
+// A child's three standard streams are ordinary Streams, so everything a socket can do they
+// can do: reads park, writes park, closing wakes whoever was parked. Output and exit are
+// independent -- a child can exit while bytes it wrote are still in the pipe, so the status
+// waits in the process handle until it is asked for and draining the output first is always
+// safe.
+
+import Local.Uv.Run.run_async
+import Local.Uv.Uv.UvError, uv_error_text
+import Local.Uv.Task.Runtime
+import Local.Uv.Async.Async
+import Local.Uv.Stream.Stream, copy_stream, AsyncWrite, awrite, stream_async_write,
+    AsyncRead, aread, stream_async_read, read_all
+import Local.Uv.Proc.Child, copy_child, Exit, copy_exit, exit_code, exit_signal,
+    exited_normally, spawn_child, wait_exit, child_close, child_close_stdin,
+    child_pid, child_stdin, child_stdout, child_stderr
+import Std.Vec.Vec, empty, push, len
+
+// A number as decimal text. `String` on its own is the type's constructor, so the cast has to
+// be spelled out.
+num (v: I64): String = cast (I32 v)
+
+// --- reading a child's two output streams and its status -------------------------------------
+
+capture (rtp: Ptr Runtime): Unit can Async =
+    // `spawn_child` supplies argv[0] itself, so these are the arguments that follow it.
+    var argv: Vec String = Vec.empty ()
+    argv.push "-c"
+    argv.push "echo to stdout; echo to stderr >&2; exit 3"
+
+    match spawn_child rtp "/bin/sh" (ref argv)
+    | Error e -> println ("spawn failed: " ++ uv_error_text (ref e))
+    | Ok ch ->
+        var c = ch
+        println ("child pid " ++ num (I64 (child_pid (ref c))))
+
+        // Both pipes are drained BEFORE the wait, which is the ordering a child that exits
+        // early would otherwise break.
+        match read_all (child_stdout (ref c))
+        | Ok text -> print ("  stdout: " ++ text)
+        | Error e -> println ("  stdout failed: " ++ uv_error_text (ref e))
+
+        match read_all (child_stderr (ref c))
+        | Ok text -> print ("  stderr: " ++ text)
+        | Error e -> println ("  stderr failed: " ++ uv_error_text (ref e))
+
+        match wait_exit (ref c)
+        | Error e -> println ("  wait failed: " ++ uv_error_text (ref e))
+        | Ok st ->
+            if exited_normally st then println ("  exited " ++ num (exit_code st))
+            else println ("  killed by signal " ++ num (exit_signal st))
+
+        child_close (mut c)
+
+// --- writing to a child ------------------------------------------------------------------------
+
+feed (rtp: Ptr Runtime): Unit can Async =
+    var argv: Vec String = Vec.empty ()
+    match spawn_child rtp "/bin/cat" (ref argv)
+    | Error e -> println ("spawn failed: " ++ uv_error_text (ref e))
+    | Ok ch ->
+        var c = ch
+        ignore (awrite (child_stdin (ref c)) "one\ntwo\nthree\n")
+        // `cat` copies until its input ends, so it has to be told there is no more of it.
+        // Its output streams stay open.
+        child_close_stdin (ref c)
+
+        match read_all (child_stdout (ref c))
+        | Ok text -> print ("cat echoed:\n" ++ text)
+        | Error e -> println ("read failed: " ++ uv_error_text (ref e))
+
+        ignore (wait_exit (ref c))
+        child_close (mut c)
+
+children (rtp: Ptr Runtime): Unit can Async =
+    capture rtp
+    println ""
+    feed rtp
+
+main () = run_async children

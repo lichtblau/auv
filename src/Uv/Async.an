@@ -1,0 +1,199 @@
+// Layer 2: an effect over the task substrate.
+//
+// `Async` is one operation, `submit`, taking a tagged Submission and returning the
+// Completion it produced. Every payload is a scalar or a pointer, so a submission travels
+// through the effect machinery's fixed-size argument storage with room to spare.
+//
+// Three handlers satisfy the same effect:
+//
+//   run_uv    registers the operation with libuv and parks the running task on it. The arm
+//             runs on the task's own stack, parks there, and calls `resume` inside its own
+//             dynamic extent -- so no continuation is ever stored and nothing Ante owns
+//             crosses the FFI.
+//   blocking  satisfies each operation with a plain synchronous call and resumes at once.
+//             No loop, no task, no coroutine: the whole program runs on the caller's stack.
+//   mock      replays a scripted list of completions, for tests that want no I/O at all.
+//
+// A program written against `Async` is the same program under all three.
+
+import Local.Uv.Uv.Loop, copy_loop, Slot, copy_slot, slot_new, slot_free, slot_rearm,
+    slot_state, slot_completion, st_done,
+    Completion, copy_completion,
+    completion_none, k_none, k_timer, k_cancelled, k_read, k_write, k_connect, k_connection,
+    k_shutdown, k_eof, k_fs, k_addrinfo, k_exit, k_closed,
+    handle_null, handle_is_null, handle_set_slot, handle_slot, close_handle,
+    timer_new, timer_start, timer_stop, uv_sleep_ms, as_i64, as_usz,
+    read_start, stream_write, stream_shutdown, tcp_connect_cstr,
+    fs_submit, fs_sync, getaddrinfo_start, getaddrinfo_sync
+import Local.Uv.Task.Runtime, rt_loop, park, park_on, current_slot, task_sleep
+import Std.Vec.Vec, len
+
+export
+    Async, submit,
+    Submission, copy_submission, sub_none, sub_op1, sub_op2, sub_op3, sub_fs, sub_addrinfo,
+    op_none, op_sleep, op_read, op_write, op_connect, op_accept, op_shutdown,
+    op_fs, op_addrinfo, op_wait_exit,
+    run_uv, blocking, mock, perform, perform_blocking,
+    sleep, sleep_result
+
+// --- the effect ----------------------------------------------------------------------------------
+
+// A submission is op-tagged and flat. `a`/`b`/`c` are the scalar arguments an operation
+// needs; `p`/`q` are handles or buffers it borrows for the duration of the call.
+type Submission =
+    op: I32
+    a: I64
+    b: I64
+    c: I64
+    d: I64
+    p: Ptr U8
+    q: Ptr U8
+
+impl copy_submission: Copy Submission with (.*) = deref
+
+effect Async =
+    submit: fn Submission -> Completion
+
+op_none (): I32 = 0
+op_sleep (): I32 = 1
+op_read (): I32 = 2
+op_write (): I32 = 3
+op_connect (): I32 = 4
+op_accept (): I32 = 5
+op_shutdown (): I32 = 6
+op_fs (): I32 = 7
+op_addrinfo (): I32 = 8
+op_wait_exit (): I32 = 9
+
+sub_none (op: I32): Submission = Submission op 0 0 0 0 (handle_null ()) (handle_null ())
+sub_op1 (op: I32) (a: I64): Submission = Submission op a 0 0 0 (handle_null ()) (handle_null ())
+sub_op2 (op: I32) (a: I64) (p: Ptr U8): Submission = Submission op a 0 0 0 p (handle_null ())
+sub_op3 (op: I32) (a: I64) (b: I64) (p: Ptr U8) (q: Ptr U8): Submission =
+    Submission op a b 0 0 p q
+
+/// A filesystem submission: `sub` picks the call, the rest are its arguments.
+sub_fs (sub: I64) (a: I64) (b: I64) (c: I64) (p: Ptr U8) (q: Ptr U8): Submission =
+    Submission (op_fs ()) sub a b c p q
+
+/// A name-resolution submission.
+sub_addrinfo (host: Ptr U8) (service: Ptr U8): Submission =
+    Submission (op_addrinfo ()) 0 0 0 0 host service
+
+// --- the op library ------------------------------------------------------------------------------
+
+/// Suspend for `ms` milliseconds.
+sleep (ms: U64): Unit can Async =
+    ignore (submit (sub_op1 (op_sleep ()) (as_i64 ms)))
+
+/// Suspend for `ms` milliseconds and report how the wait ended: false when it was cancelled.
+sleep_result (ms: U64): Bool can Async =
+    c = submit (sub_op1 (op_sleep ()) (as_i64 ms))
+    c.kind != k_cancelled ()
+
+// --- run_uv --------------------------------------------------------------------------------------
+
+/// Carry out one submission against a real loop, parking the running task on it.
+///
+/// Registration and park stay adjacent and on the task's own stack, which is the whole
+/// discipline: a completion that arrives in between lands in the slot and the park returns
+/// without ever suspending.
+///
+/// Handle-based operations (read, accept) park on the RESOURCE's slot, so a chunk or a
+/// connection that arrives with nobody waiting is held by the resource. Request-based ones
+/// (write, connect, shutdown) park on the task's own slot and pass it to the request, so
+/// their completions never land in the middle of somebody's read.
+perform (rtp: Ptr Runtime) (s: Submission): Completion =
+    if s.op == op_sleep () then task_sleep rtp s.a
+    else if s.op == op_read () then
+        slot = handle_slot s.p
+        // A chunk already waiting means the stream stopped reading when it arrived; take
+        // that one rather than restarting the read and dropping it.
+        if slot_state slot != st_done () then
+            slot_rearm slot
+            ignore (read_start s.p)
+        park_on rtp slot
+    else if s.op == op_accept () then
+        slot = handle_slot s.p
+        if slot_state slot != st_done () then slot_rearm slot
+        park_on rtp slot
+    else if s.op == op_write () then
+        mine = current_slot rtp
+        slot_rearm mine
+        r = stream_write s.p s.q (as_usz s.a) mine
+        if r != 0 then Completion (k_write ()) (I64 r) 0 (handle_null ())
+        else park_on rtp mine
+    else if s.op == op_shutdown () then
+        mine = current_slot rtp
+        slot_rearm mine
+        r = stream_shutdown s.p mine
+        if r != 0 then Completion (k_shutdown ()) (I64 r) 0 (handle_null ())
+        else park_on rtp mine
+    else if s.op == op_connect () then
+        mine = current_slot rtp
+        slot_rearm mine
+        r = tcp_connect_cstr s.p s.q (I32 s.a) mine
+        if r != 0 then Completion (k_connect ()) (I64 r) 0 (handle_null ())
+        else park_on rtp mine
+    else if s.op == op_wait_exit () then
+        // The exit lands in the process handle's own slot, which holds it until it is read.
+        slot = handle_slot s.p
+        if slot_state slot != st_done () then slot_rearm slot
+        park_on rtp slot
+    else if s.op == op_fs () then
+        mine = current_slot rtp
+        slot_rearm mine
+        r = fs_submit (rt_loop rtp) (I32 s.a) s.b s.c s.d s.p s.q mine
+        if r != 0 then Completion (k_fs ()) (I64 r) 0 (handle_null ())
+        else park_on rtp mine
+    else if s.op == op_addrinfo () then
+        mine = current_slot rtp
+        slot_rearm mine
+        r = getaddrinfo_start (rt_loop rtp) s.p s.q mine
+        if r != 0 then Completion (k_addrinfo ()) (I64 r) 0 (handle_null ())
+        else park_on rtp mine
+    else completion_none ()
+
+/// Run `body` with `Async` satisfied by this runtime's loop. Must be called on a task's
+/// stack: parking is what satisfies a submission.
+run_uv (rtp: Ptr Runtime) (body: fn Unit => a can Async): a =
+    handler h for submit s ->
+        resume (perform rtp s)
+    in body ()
+
+// --- blocking ------------------------------------------------------------------------------------
+
+/// Carry out one submission synchronously, with no loop and no task involved.
+perform_blocking (s: Submission): Completion =
+    if s.op == op_sleep () then
+        uv_sleep_ms s.a
+        Completion (k_timer ()) 0 0 (handle_null ())
+    else if s.op == op_fs () or s.op == op_addrinfo () then
+        // Plain libc, with the result left in a throwaway slot so the completion has exactly
+        // the shape the loop path would have produced.
+        tmp = slot_new ()
+        if s.op == op_fs () then ignore (fs_sync (I32 s.a) s.b s.c s.d s.p s.q tmp)
+        else ignore (getaddrinfo_sync s.p s.q tmp)
+        c = slot_completion tmp
+        slot_free tmp
+        c
+    else completion_none ()
+
+/// Run `body` with every submission satisfied by a plain synchronous call. The arm resumes
+/// in tail position, so the whole program stays on the caller's stack.
+blocking (body: fn Unit => a can Async): a =
+    handler h for submit s ->
+        resume (perform_blocking s)
+    in body ()
+
+// --- mock ----------------------------------------------------------------------------------------
+
+/// Run `body` against a scripted list of completions, in order. Submissions past the end of
+/// the script get an empty completion.
+mock (script: Ptr (Vec Completion)) (body: fn Unit => a can Async): a =
+    var i = 0usz
+    handler h for submit _s ->
+        sc = ptr_to_mut script
+        c = if i < sc.len then deref_ptr (offset sc.data i) else completion_none ()
+        i := i + 1usz
+        resume c
+    in body ()

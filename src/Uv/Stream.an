@@ -1,0 +1,277 @@
+// Byte streams over the Async effect: TCP endpoints and adopted descriptors.
+//
+// Backpressure is parking. A stream reads only while a reader is parked on it; the shim
+// stops reading the moment a chunk arrives with nobody waiting, so a slow reader propagates
+// all the way back to the sender instead of growing a buffer nobody bounded. A read chunk is
+// allocated by the shim and owned by the stream's wait slot until the reader takes it.
+//
+// A stream carries its own slot, which belongs to its READS (and, for a listener, to its
+// inbound connections). Writes, connects and shutdowns are requests and park on the calling
+// task's slot instead -- reading continues across a write, and a write completion delivered
+// into the read slot would answer somebody else's question.
+//
+// Closing wakes a parked reader with end-of-file FIRST, then closes. The slot's latch makes
+// that idempotent, so a close racing a real end-of-file cannot deliver twice. Closing is also
+// idempotent across copies of the wrapper -- see the note on the Stream type.
+//
+// One task reads a stream at a time. Two readers would park on one slot, which the slot
+// refuses outright.
+
+import Local.Uv.Uv.Loop, copy_loop, Slot, copy_slot, slot_new,
+    Completion, copy_completion,
+    k_eof, k_cancelled, k_closed,
+    UvError, uv_check, uv_error_of,
+    handle_null, handle_is_null, handle_adopt_slot, close_handle, close_handle_waking,
+    tcp_new, tcp_bind, tcp_port, listen_handle, accept_handle,
+    pipe_new, pipe_open, stream_readable, stream_writable, stream_write_queue,
+    stream_fileno, buf_string, buf_free, cstr_of_string, as_usz, as_i64
+import Local.Uv.Task.Runtime, rt_loop
+import Local.Uv.Async.Async, submit, Submission, copy_submission, sub_op2, sub_op3,
+    op_read, op_write, op_connect, op_accept, op_shutdown
+import Std.C.malloc, free
+
+export
+    Stream, copy_stream, stream_null, stream_is_null, stream_handle, stream_slot,
+    stream_adopt_fd, stream_of_handle, stream_free, stream_close, stream_at_eof, stream_fd,
+    stream_can_read, stream_can_write, stream_pending_writes,
+    Listener, copy_listener, listener_bind, listener_free, listener_close, listener_port,
+    accept, connect,
+    AsyncRead, aread, stream_async_read, AsyncWrite, awrite, stream_async_write,
+    ashutdown, read_all, write_all
+
+// uv error codes this module returns for conditions libuv itself never reports.
+e_nomem (): I32 = -12
+e_badf (): I32 = -9
+e_cancelled (): I32 = -125
+
+// --- a stream ------------------------------------------------------------------------------------
+
+// A Stream is a HANDLE ON a small heap cell, not the state itself.
+//
+// The wrapper is `Copy`, and it has to be: a stream travels through argument records, gets
+// read out of a Child, is passed to a helper. If the state lived in the wrapper, closing
+// through one copy would leave every other copy holding a handle libuv had already freed --
+// and reaching for that handle to see whether it was closed is itself the use-after-free.
+// With the state behind a shared cell, closing is visible to every copy and idempotent.
+//
+// The cell itself is not reclaimed. What it points at is: libuv's close callback releases
+// both the handle and its wait slot, on a later loop turn than any callback that might still
+// be reading them.
+type StreamState =
+    handle: Ptr U8
+    slot: Slot
+    eof: Bool
+
+type Stream = cell: Ptr StreamState
+
+impl copy_stream: Copy Stream with (.*) = deref
+
+new_state (h: Ptr U8) (sl: Slot) (at_eof: Bool): Stream =
+    p: Ptr StreamState = malloc (size_of (MkType : Type StreamState))
+    ptr_store p (StreamState h sl at_eof)
+    Stream p
+
+st_of (s: Stream): mut StreamState = ptr_to_mut s.cell
+
+stream_null (): Stream = new_state (handle_null ()) (Slot (handle_null ())) true
+stream_is_null (s: Stream): Bool = handle_is_null (st_of s).handle
+
+stream_handle (s: Stream): Ptr U8 = (st_of s).handle
+stream_slot (s: Stream): Slot = (st_of s).slot
+stream_at_eof (s: Stream): Bool = (st_of s).eof
+
+/// Attach a fresh slot to an already-initialized stream handle and wrap the pair. The handle
+/// owns the slot from here: closing it is what releases both.
+stream_of_handle (h: Ptr U8): Stream =
+    if handle_is_null h then stream_null ()
+    else
+        sl = slot_new ()
+        handle_adopt_slot h sl
+        new_state h sl false
+
+/// Wrap an already-open descriptor as a stream: a socketpair end, a pty master, a pipe.
+stream_adopt_fd (rtp: Ptr Runtime) (fd: I32): Stream =
+    h = pipe_new (rt_loop rtp) false
+    if handle_is_null h then stream_null ()
+    else if pipe_open h fd != 0 then
+        close_handle h
+        stream_null ()
+    else stream_of_handle h
+
+/// The descriptor behind the stream, or -1.
+stream_fd (s: Stream): I32 = stream_fileno (st_of s).handle
+
+stream_can_read (s: Stream): Bool =
+    h = (st_of s).handle
+    not (handle_is_null h) and stream_readable h
+
+stream_can_write (s: Stream): Bool =
+    h = (st_of s).handle
+    not (handle_is_null h) and stream_writable h
+
+/// Bytes accepted but not yet handed to the kernel.
+stream_pending_writes (s: Stream): I64 =
+    h = (st_of s).handle
+    if handle_is_null h then 0 else stream_write_queue h
+
+/// Close the stream, waking any parked reader with end-of-file first. Idempotent, and every
+/// copy of the wrapper sees it. The handle memory and the slot are released by libuv's close
+/// callback on a later loop turn.
+stream_close (s: Stream): Unit =
+    st = st_of s
+    if not (handle_is_null st.handle) then
+        h = st.handle
+        st.handle := handle_null ()
+        st.slot := Slot (handle_null ())
+        st.eof := true
+        close_handle_waking h (k_eof ()) 0
+
+/// Same as `stream_close`: the handle owns everything underneath.
+stream_free (s: Stream): Unit = stream_close s
+
+// --- a listener ------------------------------------------------------------------------------------
+
+// Behind a cell for the same reason a stream is.
+type ListenerState =
+    handle: Ptr U8
+    slot: Slot
+
+type Listener = cell: Ptr ListenerState
+
+impl copy_listener: Copy Listener with (.*) = deref
+
+ls_of (l: Listener): mut ListenerState = ptr_to_mut l.cell
+
+new_listener (h: Ptr U8) (sl: Slot): Listener =
+    p: Ptr ListenerState = malloc (size_of (MkType : Type ListenerState))
+    ptr_store p (ListenerState h sl)
+    Listener p
+
+/// Bind and listen. Port 0 asks the kernel to choose one; `listener_port` reports it.
+listener_bind (rtp: Ptr Runtime) (ip: ref String) (port: I32) (backlog: I32): Result Listener UvError =
+    h = tcp_new (rt_loop rtp)
+    if handle_is_null h then Error (uv_error_of (e_nomem ()))
+    else
+        sl = slot_new ()
+        handle_adopt_slot h sl
+        r = tcp_bind h ip port
+        r2 = if r != 0 then r else listen_handle h backlog
+        if r2 != 0 then
+            close_handle h
+            Error (uv_error_of r2)
+        else Ok (new_listener h sl)
+
+listener_port (l: Listener): I32 = tcp_port (ls_of l).handle
+
+listener_close (l: Listener): Unit =
+    st = ls_of l
+    if not (handle_is_null st.handle) then
+        h = st.handle
+        st.handle := handle_null ()
+        st.slot := Slot (handle_null ())
+        close_handle_waking h (k_closed ()) 0
+
+listener_free (l: Listener): Unit = listener_close l
+
+// --- accept and connect --------------------------------------------------------------------------------
+
+/// Wait for the next inbound connection and take it.
+///
+/// libuv holds one accepted descriptor at a time and stops watching the listening socket
+/// until it is taken, so a notification that arrives with nobody parked waits in the
+/// listener's slot rather than being lost.
+accept (rtp: Ptr Runtime) (l: Listener): Result Stream UvError can Async =
+    c = submit (sub_op2 (op_accept ()) 0 (ls_of l).handle)
+    if c.kind == k_cancelled () then Error (uv_error_of (e_cancelled ()))
+    else if c.kind == k_closed () then Error (uv_error_of (e_badf ()))
+    else if c.status < 0 then Error (uv_error_of (I32 c.status))
+    else
+        client = tcp_new (rt_loop rtp)
+        if handle_is_null client then Error (uv_error_of (e_nomem ()))
+        else
+            r = accept_handle (ls_of l).handle client
+            if r != 0 then
+                close_handle client
+                Error (uv_error_of r)
+            else Ok (stream_of_handle client)
+
+/// Connect to an IPv4 address and return the connected stream.
+connect (rtp: Ptr Runtime) (ip: ref String) (port: I32): Result Stream UvError can Async =
+    h = tcp_new (rt_loop rtp)
+    if handle_is_null h then Error (uv_error_of (e_nomem ()))
+    else
+        s = stream_of_handle h
+        // The address is only borrowed: the shim parses it into a socket address before the
+        // submission returns.
+        addr = cstr_of_string ip
+        c = submit (sub_op3 (op_connect ()) (I64 port) 0 h addr)
+        buf_free addr
+        code = if c.kind == k_cancelled () then e_cancelled ()
+               else if c.status < 0 then I32 c.status
+               else 0
+        if code != 0 then
+            stream_free s
+            Error (uv_error_of code)
+        else Ok s
+
+// --- the traits ------------------------------------------------------------------------------------------
+
+trait AsyncRead r =
+    aread: fn r -> Result (Maybe String) UvError can Async
+
+trait AsyncWrite w =
+    awrite: fn w (ref String) -> Result Unit UvError can Async
+
+impl stream_async_read: AsyncRead Stream with
+    aread s =
+        st = st_of s
+        if st.eof or handle_is_null st.handle then Ok None
+        else
+            c = submit (sub_op2 (op_read ()) 0 st.handle)
+            if c.kind == k_eof () or c.kind == k_closed () then
+                (st_of s).eof := true
+                Ok None
+            else if c.kind == k_cancelled () then Error (uv_error_of (e_cancelled ()))
+            else if c.status < 0 then
+                (st_of s).eof := true
+                Error (uv_error_of (I32 c.status))
+            else
+                text = buf_string c.payload (as_usz c.aux)
+                buf_free c.payload
+                Ok (Some text)
+
+impl stream_async_write: AsyncWrite Stream with
+    awrite s bytes =
+        h = (st_of s).handle
+        if handle_is_null h then Error (uv_error_of (e_badf ()))
+        else
+            c = submit (sub_op3 (op_write ()) (as_i64 (U64 bytes.length)) 0 h (transmute bytes.data))
+            if c.kind == k_cancelled () then Error (uv_error_of (e_cancelled ()))
+            else uv_check c.status
+
+/// Half-close the write side: the peer sees end-of-file, this side stays readable.
+ashutdown (s: Stream): Result Unit UvError can Async =
+    h = (st_of s).handle
+    if handle_is_null h then Ok ()
+    else
+        c = submit (sub_op2 (op_shutdown ()) 0 h)
+        uv_check c.status
+
+/// Read until end of file, concatenating everything.
+read_all (s: Stream): Result String UvError can Async =
+    var acc = ""
+    var going = true
+    var failed = false
+    var err = uv_error_of 0
+    while going do
+        match aread s
+        | Ok (Some chunk) -> acc := acc ++ chunk
+        | Ok None -> going := false
+        | Error e ->
+            err := e
+            failed := true
+            going := false
+    if failed then Error err else Ok acc
+
+/// Write the whole string, reporting the first failure.
+write_all (s: Stream) (bytes: ref String): Result Unit UvError can Async = awrite s bytes

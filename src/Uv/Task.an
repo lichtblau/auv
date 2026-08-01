@@ -1,0 +1,568 @@
+// Layer 1: tasks over the wait slots of Layer 0.
+//
+// A task is a stackful coroutine plus one wait slot. It runs until it registers a libuv
+// operation and parks; the shim's trampoline for that operation writes the completion into
+// the slot and resumes the coroutine from inside the loop turn that produced it. The
+// scheduler owns the loop and the ready queue and is the only thing that reaps.
+//
+// The park/resume rules, stated once:
+//
+//   1. Register the operation first, park immediately after, in the same function, on the
+//      task's own stack. Anything between the two is a window where a completion can arrive
+//      with nobody parked -- which the slot handles, but only if the pair stays adjacent.
+//   2. Nothing outside the shim resumes a coroutine. Waking a task is `slot_post` plus a
+//      push onto the ready queue (deferred, from a task's stack) or `slot_deliver`
+//      (immediate, from a trampoline). Both go through the slot's one-shot latch.
+//   3. A task is reaped by the scheduler only after its entry has returned. Never by a
+//      trampoline, never while parked: cancelling a parked task resumes it with a
+//      `cancelled` completion and it exits by returning.
+//   4. Two operations racing for one waiter (an operation and its timeout) point at one
+//      slot, so the latch picks a winner and the loser's completion is dropped. The winner's
+//      continuation closes the loser's handle.
+//   5. An operation on a resource that outlives it -- a listening socket, a connected stream
+//      -- parks on the RESOURCE's slot, not the task's. A completion that arrives while
+//      nobody is waiting is then held by the resource until the next operation reads it,
+//      instead of landing in the slot of whatever the task went on to do next.
+//
+// Cancellation is a value, never an unwind: nothing in this module throws across a parked
+// frame, because the abort path would strand the whole coroutine stack.
+//
+// The module declares its own coroutine externs rather than importing the editor's wrapper.
+// The symbols are the ones the compiler already links into every binary; an extern
+// declaration is a declaration, and the independence keeps src/Uv self-contained.
+
+import Local.Uv.Uv.Loop, loop_new, loop_run_once, loop_run_nowait, loop_alive,
+    loop_walk_close_all, loop_close_free, loop_null, loop_is_null, copy_loop,
+    Slot, slot_new, slot_free, slot_park, slot_completion, slot_post, slot_rearm, copy_slot,
+    Completion, completion_none, copy_completion, k_cancelled, k_joined, k_timer,
+    handle_null, handle_is_null, handle_set_slot, close_handle,
+    timer_new, timer_start, timer_stop,
+    poll_new, poll_start, poll_stop, uv_writable, k_poll
+import Std.Vec.Vec, empty, push, len, clear
+import Std.C.malloc, free
+
+export
+    Runtime, rt_new, rt_free, rt_loop, rt_task_count, rt_live_count, rt_is_shutting_down,
+    Task, ts_running, ts_parked, ts_done, ts_reaped,
+    spawn, spawn_default, park, park_on, join, cancel, wake, abandon,
+    run, step, step_nowait, run_ready, has_ready, shutdown,
+    current_id, current_slot, on_own_stack, task_state, task_result, set_result,
+    default_stack_bytes, task_sleep, sleep_ms, task_wait_writable
+
+// --- coroutine primitives ----------------------------------------------------------------------
+// `mco_coro_init` hardcodes a 56 KB stack; `pc_coro_init_sized` (src/Runtime/csrc/pc_coro.c) is
+// the same construction with a real size, which is what makes per-task stack sizing possible.
+pc_coro_init_sized = extern "pc_coro_init_sized": fn (Ptr U8) (Ptr U8) Usz -> Ptr U8
+mco_suspend        = extern "mco_coro_suspend":   fn (Ptr U8) -> U8
+mco_free           = extern "mco_coro_free":      fn (Ptr U8) -> U8
+mco_get_user_data  = extern "mco_coro_get_user_data": fn (Ptr U8) -> Ptr U8
+mco_running        = extern "mco_coro_running":   fn Unit -> Ptr U8
+
+// The shim owns the only `mco_coro_resume` call site and, with it, the answer to
+// "which task is running", which stays right even when an effect handler has interposed a
+// coroutine of its own between the task and the code asking.
+auv_current_task = extern "auv_current_task": fn Unit -> Ptr U8
+auv_resume_task  = extern "auv_resume_task":  fn (Ptr U8) -> Unit
+
+/// 256 KB. Tasks here run protocol code, not deeply recursive native work; a caller that
+/// needs more passes its own size to `spawn`.
+default_stack_bytes (): Usz = 262144usz
+
+// --- tasks -------------------------------------------------------------------------------------
+ts_running (): I32 = 0
+ts_parked (): I32 = 1
+ts_done (): I32 = 2
+ts_reaped (): I32 = 3
+
+type Task =
+    id: U64
+    co: Ptr U8
+    slot: Slot
+    // The slot this task is parked on right now. Usually its own, but an operation on a
+    // long-lived resource parks on THAT resource's slot instead, so a completion arriving
+    // while nobody waits is held by the resource rather than dropped. Waking a task
+    // (cancel, join) always goes through this one.
+    wait: Slot
+    ctx: Ptr U8
+    state: I32
+    result: I32
+    // Set by `set_result`, cleared by the `join` that collects it. A retired row with this still
+    // set is holding an answer for somebody, and `reap` will not compact it away underneath them.
+    has_result: Bool
+    joiners: Vec U64
+
+type Runtime =
+    uvloop: Loop
+    tasks: Vec Task
+    ready: Vec U64
+    ready_head: Usz
+    next_id: U64
+    shutting_down: Bool
+
+// The coroutine's user data. Scalars only: it is read back through a raw pointer on the
+// task's own stack, which rules out anything that would need to be cloned or dropped.
+type TaskCtx =
+    rt: Ptr Runtime
+    id: U64
+    entry: Ptr U8
+    arg: Ptr U8
+
+impl copy_taskctx: Copy TaskCtx with (.*) = deref
+
+// --- runtime lifecycle ---------------------------------------------------------------------------
+
+/// Create a runtime with its own event loop. The Runtime lives at a stable heap address
+/// because tasks reach it from their own stacks while the scheduler is suspended inside a
+/// resume, and a moving struct would leave those references behind.
+rt_new (): Ptr Runtime =
+    p: Ptr Runtime = malloc (size_of (MkType : Type Runtime))
+    ptr_store p (Runtime (loop_new ()) (Vec.empty ()) (Vec.empty ()) 0usz 1u64 false)
+    p
+
+/// Release the runtime record itself. `shutdown` must have run first: this frees no task.
+rt_free (rtp: Ptr Runtime): Unit =
+    rt = ptr_to_mut rtp
+    vec_release (mut rt.tasks)
+    vec_release (mut rt.ready)
+    free (transmute rtp)
+
+// Vec has no destructor in this compiler; release the one allocation it owns.
+vec_release (v: mut Vec a): Unit =
+    if not (handle_is_null (transmute v.data)) then free (transmute v.data)
+    v.data := transmute 0usz
+    v.len := 0usz
+    v.cap := 0usz
+
+rt_loop (rtp: Ptr Runtime): Loop = (ptr_to_mut rtp).uvloop
+
+rt_is_shutting_down (rtp: Ptr Runtime): Bool = (ptr_to_mut rtp).shutting_down
+
+/// Task records on the table. Reaped ones are dropped from it, so this is the live count plus
+/// whatever has finished since the last reap.
+rt_task_count (rtp: Ptr Runtime): Usz = (ptr_to_mut rtp).tasks.len
+
+/// Tasks that have not been reaped yet.
+rt_live_count (rtp: Ptr Runtime): Usz =
+    rt = ptr_to_mut rtp
+    var n = 0usz
+    var i = 0usz
+    while i < rt.tasks.len do
+        if (task_at rt i).state != ts_reaped () then n := n + 1usz
+        i := i + 1usz
+    n
+
+// --- task table --------------------------------------------------------------------------------
+// Element access goes through the raw buffer: a `mut Task` is only ever held across
+// straight-line code, because a spawn from a resumed task can grow (and move) the vector.
+task_at (rt: mut Runtime) (i: Usz): mut Task = ptr_to_mut (offset rt.tasks.data i)
+
+// Index of the task with this id, or the table length when there is none.
+index_of (rt: mut Runtime) (id: U64): Usz =
+    var i = 0usz
+    var found = rt.tasks.len
+    while i < rt.tasks.len do
+        if (task_at rt i).id == id then
+            found := i
+            i := rt.tasks.len
+        else i := i + 1usz
+    found
+
+index_of_co (rt: mut Runtime) (co: Ptr U8): Usz =
+    var i = 0usz
+    var found = rt.tasks.len
+    while i < rt.tasks.len do
+        if (transmute (task_at rt i).co : Usz) == (transmute co : Usz) then
+            found := i
+            i := rt.tasks.len
+        else i := i + 1usz
+    found
+
+/// The id of the task whose stack is running, or 0 outside any task.
+current_id (rtp: Ptr Runtime): U64 =
+    rt = ptr_to_mut rtp
+    co = auv_current_task ()
+    if handle_is_null co then 0u64
+    else
+        i = index_of_co rt co
+        if i >= rt.tasks.len then 0u64 else (task_at rt i).id
+
+/// The running task's wait slot: what an operation registration points its handle at.
+current_slot (rtp: Ptr Runtime): Slot =
+    rt = ptr_to_mut rtp
+    co = auv_current_task ()
+    i = index_of_co rt co
+    if i >= rt.tasks.len then Slot (handle_null ()) else (task_at rt i).slot
+
+/// Is the caller running on its own task's stack -- the one place `park` is legal?
+///
+/// `current_id` answers a different question, "which task does this code belong to", and keeps
+/// answering it truthfully when an interpreter or an effect handler has interposed a coroutine of
+/// its own between the task and the code asking. Parking from THERE is the error `park` panics on
+/// (rule 1: the park must be on the task's own stack), so an operation that parks WHEN IT CAN and
+/// blocks when it cannot has to ask this one instead. False off a task entirely.
+on_own_stack (rtp: Ptr Runtime): Bool =
+    rt = ptr_to_mut rtp
+    co = auv_current_task ()
+    if handle_is_null co then false
+    else if (transmute (mco_running ()) : Usz) != (transmute co : Usz) then false
+    else index_of_co rt co < rt.tasks.len
+
+task_state (rtp: Ptr Runtime) (id: U64): I32 =
+    rt = ptr_to_mut rtp
+    i = index_of rt id
+    if i >= rt.tasks.len then ts_reaped () else (task_at rt i).state
+
+task_result (rtp: Ptr Runtime) (id: U64): I32 =
+    rt = ptr_to_mut rtp
+    i = index_of rt id
+    if i >= rt.tasks.len then 0 else (task_at rt i).result
+
+/// Record the running task's exit code, readable by whoever joins it.
+///
+/// This is also what asks the runtime to KEEP this task's row after it is retired, until the result
+/// has been collected -- see `reap`. A task that never reports a result is reaped and forgotten,
+/// and one that reports a result nobody ever joins holds its row (a few dozen bytes, no coroutine
+/// and no slot) for the runtime's life. That is the same bargain a `JoinHandle` makes elsewhere:
+/// report a result and someone is expected to take it.
+set_result (rtp: Ptr Runtime) (code: I32): Unit =
+    rt = ptr_to_mut rtp
+    i = index_of_co rt (auv_current_task ())
+    if i < rt.tasks.len then
+        (task_at rt i).result := code
+        (task_at rt i).has_result := true
+
+// --- spawn --------------------------------------------------------------------------------------
+
+// The coroutine entry every task starts in. Recovers its context, calls the caller's entry
+// function, then marks itself finished; the scheduler reaps it once this returns.
+task_entry (co: Ptr U8): Unit =
+    ctxp: Ptr TaskCtx = transmute (mco_get_user_data co)
+    ctx: TaskCtx = deref_ptr ctxp
+    body: fn (Ptr U8) -> Unit = transmute ctx.entry
+    body ctx.arg
+    finish ctx.rt ctx.id
+
+/// Start a task running `entry` (a plain `fn (Ptr U8) -> Unit`, passed as a pointer) with
+/// `arg` as its argument, on a stack of `stack_bytes` (0 for the default).
+///
+/// The new task runs immediately, right here, until its first park or its return -- there is
+/// no queue of not-yet-started tasks, so nothing has to hold on to the entry in the meantime.
+spawn (rtp: Ptr Runtime) (entry: Ptr U8) (arg: Ptr U8) (stack_bytes: Usz): U64 =
+    rt = ptr_to_mut rtp
+    id = rt.next_id
+    rt.next_id := id + 1u64
+    ctxp: Ptr TaskCtx = malloc (size_of (MkType : Type TaskCtx))
+    ptr_store ctxp (TaskCtx rtp id entry arg)
+    sz = if stack_bytes == 0usz then default_stack_bytes () else stack_bytes
+    co = pc_coro_init_sized (transmute (task_entry : fn (Ptr U8) -> Unit)) (transmute ctxp) sz
+    own = slot_new ()
+    rt.tasks.push (Task id co own own (transmute ctxp) (ts_running ()) 0 false (Vec.empty ()))
+    auv_resume_task co
+    id
+
+spawn_default (rtp: Ptr Runtime) (entry: Ptr U8) (arg: Ptr U8): U64 = spawn rtp entry arg 0usz
+
+// --- park ------------------------------------------------------------------------------------
+
+/// Suspend the running task until a completion lands in its own slot. Called from the task's
+/// own stack, immediately after the operation that will produce that completion was
+/// registered.
+park (rtp: Ptr Runtime): Completion = park_on rtp (current_slot rtp)
+
+/// Suspend the running task on `slot`, which may belong to a resource rather than to the
+/// task. Everything else is the same: the task is marked parked, the slot records which
+/// coroutine to resume, and a completion that is already sitting there skips the suspend.
+park_on (rtp: Ptr Runtime) (slot: Slot): Completion =
+    rt = ptr_to_mut rtp
+    co = auv_current_task ()
+    if handle_is_null co then panic "Uv.Task.park: not on a task stack"
+    if (transmute (mco_running ()) : Usz) != (transmute co : Usz) then
+        panic "Uv.Task.park: parking from a nested coroutine, not the task's own stack"
+    i = index_of_co rt co
+    if i >= rt.tasks.len then panic "Uv.Task.park: no task record for the running coroutine"
+    (task_at rt i).wait := slot
+    (task_at rt i).state := ts_parked ()
+    if slot_park slot co then ignore (mco_suspend co)
+    // Resumed: the table may have grown while we were away, so find the record again.
+    j = index_of_co rt co
+    if j < rt.tasks.len then
+        (task_at rt j).state := ts_running ()
+        (task_at rt j).wait := (task_at rt j).slot
+    slot_completion slot
+
+// --- finish, join, cancel ------------------------------------------------------------------------
+
+// Mark a task finished and hand every joiner its completion. Joiners are queued rather than
+// resumed: this runs at the very end of the finishing task's entry, and resuming there would
+// nest a joiner's whole remaining execution inside a frame that is about to disappear.
+finish (rtp: Ptr Runtime) (id: U64): Unit =
+    rt = ptr_to_mut rtp
+    i = index_of rt id
+    if i < rt.tasks.len then
+        (task_at rt i).state := ts_done ()
+        code = (task_at rt i).result
+        var k = 0usz
+        while k < (task_at rt i).joiners.len do
+            jid = deref_ptr (offset (task_at rt i).joiners.data k)
+            wake rtp jid (k_joined ()) (I64 code)
+            k := k + 1usz
+        (task_at rt i).joiners.clear ()
+
+/// Post a completion to a task and, if it was parked on it, queue it for the scheduler.
+///
+/// This is how anything OUTSIDE the runtime answers a task's question -- a key arrived, a prompt
+/// was submitted, a capture exited. The wake is deferred on purpose: it goes through the latch and
+/// onto the ready queue, so the woken task's continuation never runs nested inside the frame of
+/// whoever woke it. `run_ready` is what actually resumes it.
+wake (rtp: Ptr Runtime) (id: U64) (kind: I32) (status: I64): Unit =
+    rt = ptr_to_mut rtp
+    i = index_of rt id
+    if i < rt.tasks.len and (task_at rt i).state == ts_parked () then
+        if slot_post (task_at rt i).wait kind status 0 then
+            rt.ready.push id
+
+/// Wait for another task to finish and return its result. Joining a task that has already
+/// finished returns straight away.
+join (rtp: Ptr Runtime) (target: U64): I32 =
+    rt = ptr_to_mut rtp
+    me = current_id rtp
+    i = index_of rt target
+    if i >= rt.tasks.len then 0
+    else if (task_at rt i).state == ts_done () or (task_at rt i).state == ts_reaped () then
+        // Collected: the row has done its job and `reap` may drop it from here on. A second join of
+        // the same finished task gets 0, exactly as it did before results outlived reaping.
+        (task_at rt i).has_result := false
+        (task_at rt i).result
+    else if me == 0u64 then panic "Uv.Task.join: not on a task stack"
+    else
+        (task_at rt i).joiners.push me
+        c = park rtp
+        I32 c.status
+
+/// Ask a task to stop. It is resumed with a `cancelled` completion out of its park and is
+/// expected to return; nothing is unwound and no stack is discarded.
+cancel (rtp: Ptr Runtime) (id: U64): Unit = wake rtp id (k_cancelled ()) 0
+
+/// Discard a parked task WITHOUT resuming it: release the coroutine, and with it the frames it was
+/// suspended in, and retire the record.
+///
+/// The one thing `cancel` cannot express. Cancelling resumes a task so that it can return, which
+/// means its continuation runs -- and there are continuations that must not run at all. An editor
+/// command abandoned at its prompt is exactly that: everything after the read would proceed with
+/// an answer nobody gave. Freeing a suspended coroutine reclaims its stack, so this discards the
+/// frames rather than leaking them.
+abandon (rtp: Ptr Runtime) (id: U64): Unit =
+    rt = ptr_to_mut rtp
+    i = index_of rt id
+    if i >= rt.tasks.len then ()
+    else
+        // A slot with a task still parked on it cannot be freed. Clear the park through the latch;
+        // the completion posted here is read by nobody, because nobody is going to be resumed.
+        if (task_at rt i).state == ts_parked () then
+            ignore (slot_post (task_at rt i).wait (k_cancelled ()) 0 0)
+        (task_at rt i).state := ts_done ()
+        reap rtp
+
+// --- the scheduler --------------------------------------------------------------------------------
+
+// Resume every task the ready queue holds. New entries pushed while draining are picked up
+// by the same loop, which is why the head index moves instead of the vector shrinking.
+drain_ready (rtp: Ptr Runtime): Unit =
+    rt = ptr_to_mut rtp
+    while rt.ready_head < rt.ready.len do
+        id = deref_ptr (offset rt.ready.data rt.ready_head)
+        rt.ready_head := rt.ready_head + 1usz
+        if rt.ready_head >= rt.ready.len then
+            rt.ready.clear ()
+            rt.ready_head := 0usz
+        i = index_of rt id
+        if i < rt.tasks.len and (task_at rt i).state == ts_parked () then
+            auv_resume_task (task_at rt i).co
+
+// Free the coroutine, slot and context of every finished task, and drop its row.
+//
+// Dropping the row is not tidiness. A program that spawns a task per unit of work -- an editor
+// spawns one per keystroke -- would otherwise grow this vector for the life of the process, and
+// every lookup walks it. Everything that refers to a task does so by ID, never by index, which is
+// what makes removal safe here; the ids themselves are never reused (`next_id` only counts up).
+//
+// Only ever called from the scheduler's own stack, where no task frame is live.
+reap (rtp: Ptr Runtime): Unit =
+    rt = ptr_to_mut rtp
+    var i = 0usz
+    var any = false
+    while i < rt.tasks.len do
+        if (task_at rt i).state == ts_done () then
+            t = task_at rt i
+            ignore (mco_free t.co)
+            slot_free t.slot
+            free t.ctx
+            vec_release (mut t.joiners)
+            t.co := handle_null ()
+            t.ctx := handle_null ()
+            t.state := ts_reaped ()
+            any := true
+        i := i + 1usz
+    if any then
+        // Compact in place: walk once, moving the survivors down over the retired rows.
+        //
+        // A retired row with an UNCOLLECTED result survives too, and that is not an optimization --
+        // it is what makes `join` above mean anything for a task that has already finished. The
+        // heavy parts (coroutine stack, wait slot, context) were freed a few lines up regardless;
+        // what is kept is the record. Dropping these was a real bug: `test_spawn_storm` joins 500
+        // children in spawn order, and the ones that finished in an earlier scheduler turn had been
+        // compacted away by the time their turn came, so `join` fell through to its not-found arm
+        // and returned 0. It only showed at -O3, where spawning 500 coroutines is fast enough that
+        // the timers expire in staggered batches instead of all at once.
+        var w = 0usz
+        var r = 0usz
+        while r < rt.tasks.len do
+            if (task_at rt r).state != ts_reaped () or (task_at rt r).has_result then
+                if w != r then array_insert rt.tasks.data w (deref_ptr (offset rt.tasks.data r))
+                w := w + 1usz
+            r := r + 1usz
+        rt.tasks.len := w
+
+/// Run until every task has finished and the loop has nothing left to wait on.
+run (rtp: Ptr Runtime): Unit =
+    rt = ptr_to_mut rtp
+    var going = true
+    while going do
+        drain_ready rtp
+        reap rtp
+        if rt_live_count rtp == 0usz then going := false
+        else if not (loop_alive rt.uvloop) and rt.ready_head >= rt.ready.len then going := false
+        else ignore (loop_run_once rt.uvloop)
+
+/// One turn, for an embedder that owns the outer loop instead of handing it to `run`: resume
+/// everything the ready queue holds, reap what finished, then block until the loop has at least
+/// one completion to report. `run`'s body is this plus its termination test -- which is the part
+/// an embedder must not have, because its loop outlives every task in it.
+///
+/// This is the ONLY place such a program is allowed to wait. Calling it from a task's stack, or
+/// from anything the loop itself invoked, is the nested-loop error the shim asserts on.
+step (rtp: Ptr Runtime): Unit =
+    rt = ptr_to_mut rtp
+    drain_ready rtp
+    reap rtp
+    ignore (loop_run_once rt.uvloop)
+
+/// Resume every task the ready queue holds, right now, and reap what finishes. What `step` does
+/// before it waits, on its own -- for an embedder that has just woken a task and needs its
+/// continuation to run inside the SAME frame rather than on the next turn of the loop. An editor
+/// submitting a prompt needs exactly that: the command it resumes is expected to have finished by
+/// the time the screen is drawn.
+///
+/// Like everything else here, for the scheduler's stack only.
+run_ready (rtp: Ptr Runtime): Unit =
+    drain_ready rtp
+    reap rtp
+
+/// Is there a woken task waiting to be resumed? `run_ready` says nothing about whether it had
+/// anything to do, and an embedder that owes a REPAINT after a continuation runs has to know the
+/// difference: an editor resuming a command from a child's exit must draw the frame that command
+/// produced, and must not draw one for a turn in which nothing ran.
+has_ready (rtp: Ptr Runtime): Bool =
+    rt = ptr_to_mut rtp
+    rt.ready_head < rt.ready.len
+
+/// `step` without the wait: service whatever is already ready and come straight back. What an
+/// embedder uses when it still owes work of its own (a half-drained burst, a macro mid-replay)
+/// and must not block, but still wants the loop's completions delivered first.
+step_nowait (rtp: Ptr Runtime): Unit =
+    rt = ptr_to_mut rtp
+    drain_ready rtp
+    reap rtp
+    ignore (loop_run_nowait rt.uvloop)
+
+/// Tear the runtime down: cancel whatever is still parked, let those tasks return, close
+/// every handle the loop still owns and free the loop.
+///
+/// A task that ignores its cancellation and parks again is cancelled again, up to a bounded
+/// number of rounds; past that the loop is closed out from under it.
+shutdown (rtp: Ptr Runtime): Unit =
+    rt = ptr_to_mut rtp
+    rt.shutting_down := true
+    var rounds = 0
+    while rounds < 64 and rt_live_count rtp > 0usz do
+        var i = 0usz
+        while i < rt.tasks.len do
+            if (task_at rt i).state == ts_parked () then cancel rtp (task_at rt i).id
+            i := i + 1usz
+        drain_ready rtp
+        reap rtp
+        if rt_live_count rtp > 0usz and loop_alive rt.uvloop then
+            ignore (loop_run_nowait rt.uvloop)
+        rounds := rounds + 1
+    loop_walk_close_all rt.uvloop
+    var tries = 0
+    var closed = false
+    while not closed and tries < 1024 do
+        if loop_close_free rt.uvloop == 0 then closed := true
+        else
+            ignore (loop_run_nowait rt.uvloop)
+            tries := tries + 1
+    rt.uvloop := loop_null ()
+    vec_release (mut rt.tasks)
+    vec_release (mut rt.ready)
+    rt.ready_head := 0usz
+
+// --- the one operation Layer 1 owns ----------------------------------------------------------------
+
+/// Park the running task on a one-shot timer. The timer is closed on every path, including
+/// cancellation, so no trampoline can ever reach the slot of a task that is already gone.
+task_sleep (rtp: Ptr Runtime) (ms: I64): Completion =
+    slot = current_slot rtp
+    if handle_is_null slot.handle then panic "Uv.Task.task_sleep: not on a task stack"
+    h = timer_new (rt_loop rtp)
+    if handle_is_null h then completion_none ()
+    else
+        handle_set_slot h slot
+        slot_rearm slot
+        ignore (timer_start h ms 0)
+        c = park rtp
+        ignore (timer_stop h)
+        close_handle h
+        c
+
+/// Park until `fd` is WRITABLE, or until `timeout_ms` has passed, whichever happens first.
+///
+/// A connect in flight is why this exists. A nonblocking `connect(2)` reports its outcome by making
+/// the descriptor writable, and the usual way to wait for that -- `poll(2)` with a deadline, on
+/// whatever stack asked -- is exactly the freeze parking exists to remove: a host that never
+/// answers costs the caller its whole timeout with nothing else running.
+///
+/// Two handles, one slot, which the latch is what makes safe: whichever completion arrives first
+/// fills the slot and wakes the task, and the loser is dropped rather than queued. Both handles are
+/// stopped and closed on every path out, cancellation included, so no trampoline can reach the slot
+/// of a task that has moved on. The completion's KIND is the answer -- `k_poll` writable, `k_timer`
+/// timed out, `k_cancelled` woken by somebody (a C-g, in the editor).
+///
+/// `handle_set_slot`, not `handle_adopt_slot`: these are transient handles borrowing the task's own
+/// slot, which outlives them and is not theirs to free.
+task_wait_writable (rtp: Ptr Runtime) (fd: I32) (timeout_ms: I64): Completion =
+    slot = current_slot rtp
+    if handle_is_null slot.handle then panic "Uv.Task.task_wait_writable: not on a task stack"
+    ph = poll_new (rt_loop rtp) fd
+    th = timer_new (rt_loop rtp)
+    if handle_is_null ph or handle_is_null th then
+        if not (handle_is_null ph) then close_handle ph
+        if not (handle_is_null th) then close_handle th
+        completion_none ()
+    else
+        handle_set_slot ph slot
+        handle_set_slot th slot
+        slot_rearm slot
+        ignore (poll_start ph (uv_writable ()))
+        ignore (timer_start th timeout_ms 0)
+        c = park rtp
+        ignore (poll_stop ph)
+        close_handle ph
+        ignore (timer_stop th)
+        close_handle th
+        c
+
+/// Sleep, discarding the completion. Returns false when the sleep was cancelled.
+sleep_ms (rtp: Ptr Runtime) (ms: I64): Bool =
+    c = task_sleep rtp ms
+    c.kind == k_timer ()
