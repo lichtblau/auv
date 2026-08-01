@@ -1,0 +1,251 @@
+// File-watching suite: both ways of asking, against a directory of this process's own.
+//
+// Every scenario carries a WATCHDOG -- an unreferenced sleep that cancels the waiter if the
+// change never shows up. A watch that never fires would otherwise hang the suite instead of
+// failing it, and "never fires" is a real possibility here: inotify is a kernel service that a
+// filesystem or a container may simply not offer.
+
+import Local.Harness.TestState, ok, is_i32, is_i64, is_usz
+import Local.Uv.Uv.UvError, uv_error_text, uv_err_name_of, handle_is_null, loop_alive,
+    loop_thread_faults, getpid, as_i64, as_u64
+import Local.Uv.Task.Runtime, rt_new, rt_free, rt_loop, rt_live_count, rt_task_count,
+    spawn_default, run, shutdown, cancel, sleep_ms
+import Local.Uv.Async.Async, run_uv, blocking, sleep, sleep_unref
+import Local.Uv.Fs.FileInfo, copy_fileinfo, fi_size,
+    fs_mkdir, fs_rmdir, fs_unlink, write_file
+import Local.Uv.Watch.Watch, copy_watch, watch_path, poll_path, watch_is_poll,
+    await_change, await_poll, watch_close, watch_ref, watch_unref, watch_has_ref,
+    Change, ch_name, ch_renamed, ch_changed
+import Std.Vec.Vec, empty, push, len
+import Std.C.malloc, free
+import Std.String.eq_string
+
+export run_watch_tests
+
+// --- shared shapes ---------------------------------------------------------------------------
+
+type Arg =
+    rt: Ptr Runtime
+    log: Ptr (Vec I64)
+    dir: Ptr String
+    a: I64
+
+impl copy_warg: Copy Arg with (.*) = deref
+
+arg_of (p: Ptr U8): Arg = deref_ptr (transmute p : Ptr Arg)
+
+log_push (a: Arg) (v: I64): Unit =
+    lg = ptr_to_mut a.log
+    lg.push v
+
+new_log (): Ptr (Vec I64) =
+    p: Ptr (Vec I64) = malloc (size_of (MkType : Type (Vec I64)))
+    ptr_store p (Vec.empty ())
+    p
+
+log_at (p: Ptr (Vec I64)) (i: Usz): I64 =
+    lg = ptr_to_mut p
+    if i >= lg.len then -1 else deref_ptr (offset lg.data i)
+
+log_len (p: Ptr (Vec I64)): Usz = (ptr_to_mut p).len
+
+free_log (p: Ptr (Vec I64)): Unit =
+    lg = ptr_to_mut p
+    if not (handle_is_null (transmute lg.data)) then free (transmute lg.data)
+    free (transmute p)
+
+new_args (n: Usz): Ptr Arg = malloc (n * size_of (MkType : Type Arg))
+arg_slot (base: Ptr Arg) (i: Usz): Ptr Arg = offset base i
+
+new_dir_cell (): Ptr String =
+    p: Ptr String = malloc (size_of (MkType : Type String))
+    ptr_store p "/tmp/uv-watch-${getpid ()}"
+    p
+
+dir_of (p: Ptr String): String = clone (ptr_to_mut p)
+path_in (dir: Ptr String) (name: String): String = dir_of dir ++ "/" ++ name
+watched_name (): String = "watched.txt"
+
+// The deadline that keeps a watch that never fires from hanging the suite. Unreferenced, so it
+// costs nothing when it is not needed: the scenario's own tasks finish and `run` returns with
+// this one still parked.
+watchdog (p: Ptr U8): Unit =
+    arg = arg_of p
+    run_uv arg.rt fn () ->
+        if sleep_unref 3000u64 then cancel arg.rt (as_u64 arg.a)
+
+// --- the kernel telling you ----------------------------------------------------------------------
+
+// Watch the directory, then wait. The sibling below creates a file in it.
+event_waiter (p: Ptr U8): Unit =
+    arg = arg_of p
+    run_uv arg.rt fn () ->
+        match watch_path arg.rt (dir_of arg.dir) 0
+        | Error _e -> log_push arg -1
+        | Ok w ->
+            log_push arg 1
+            match await_change w
+            | Error _e -> log_push arg -2
+            | Ok ch ->
+                log_push arg (if ch_name (ref ch) == watched_name () then 2 else -3)
+                log_push arg (if ch_renamed (ref ch) or ch_changed (ref ch) then 3 else -4)
+            watch_close w
+
+toucher (p: Ptr U8): Unit =
+    arg = arg_of p
+    run_uv arg.rt fn () ->
+        // Long enough that the watch above is certainly established first.
+        sleep 80u64
+        ignore (write_file (path_in arg.dir (watched_name ())) "hello")
+
+test_watch_event (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    dir = new_dir_cell ()
+    ignore (blocking fn () -> fs_mkdir (dir_of dir) 493)          // 0755
+    ignore (blocking fn () -> fs_unlink (path_in dir (watched_name ())))
+
+    args = new_args 3usz
+    ptr_store (arg_slot args 0usz) (Arg rtp lg dir 0)
+    id = spawn_default rtp (transmute (event_waiter : fn (Ptr U8) -> Unit))
+                           (transmute (arg_slot args 0usz))
+    ptr_store (arg_slot args 1usz) (Arg rtp lg dir 0)
+    ignore (spawn_default rtp (transmute (toucher : fn (Ptr U8) -> Unit))
+                              (transmute (arg_slot args 1usz)))
+    ptr_store (arg_slot args 2usz) (Arg rtp lg dir (as_i64 id))
+    ignore (spawn_default rtp (transmute (watchdog : fn (Ptr U8) -> Unit))
+                              (transmute (arg_slot args 2usz)))
+    run rtp
+
+    t.is_i64 "watch_event: the watch started" (log_at lg 0usz) 1
+    t.is_i64 "watch_event: it named the file that appeared" (log_at lg 1usz) 2
+    t.is_i64 "watch_event: and said what happened to it" (log_at lg 2usz) 3
+    t.is_i64 "watch_event: no completion off the loop thread"
+             (loop_thread_faults (rt_loop rtp)) 0
+
+    shutdown rtp
+    free_log lg
+    rt_free rtp
+    ignore (blocking fn () -> fs_unlink (path_in dir (watched_name ())))
+    ignore (blocking fn () -> fs_rmdir (dir_of dir))
+    free (transmute dir)
+    free (transmute args)
+
+// --- a stat on a timer ------------------------------------------------------------------------------
+
+// The same shape, asked the other way: poll the file every 30 ms and report the size it has
+// after the sibling has grown it.
+poll_waiter (p: Ptr U8): Unit =
+    arg = arg_of p
+    run_uv arg.rt fn () ->
+        match poll_path arg.rt (path_in arg.dir (watched_name ())) 30
+        | Error _e -> log_push arg -1
+        | Ok w ->
+            log_push arg (if watch_is_poll w then 1 else -5)
+            // Until it settles at the size the writer meant, rather than on the first report.
+            // A poll watch says what it SAW, and what it can see includes a file between the
+            // truncate and the write of a two-step rewrite -- those are two loop turns apart,
+            // so a poll due in between finds an empty file and is quite right to say so. A
+            // program that wants the finished article waits for it; the watchdog is what ends
+            // this loop if it never comes.
+            var size = 0
+            var going = true
+            while going do
+                match await_poll w
+                | Error _e -> going := false
+                | Ok info ->
+                    size := fi_size info
+                    if size == 10 then going := false
+            log_push arg size
+            // Awaiting a poll watch the other way round is an error rather than a misread
+            // payload, which is what recording the kind is for.
+            match await_change w
+            | Error _e -> log_push arg 4
+            | Ok _ch -> log_push arg -6
+            watch_close w
+
+grower (p: Ptr U8): Unit =
+    arg = arg_of p
+    run_uv arg.rt fn () ->
+        sleep 120u64
+        ignore (write_file (path_in arg.dir (watched_name ())) "0123456789")
+
+test_watch_poll (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    dir = new_dir_cell ()
+    ignore (blocking fn () -> fs_mkdir (dir_of dir) 493)
+    // A poll watch needs the file to exist first, so it has a size to notice a change from.
+    ignore (blocking fn () -> write_file (path_in dir (watched_name ())) "x")
+
+    args = new_args 3usz
+    ptr_store (arg_slot args 0usz) (Arg rtp lg dir 0)
+    id = spawn_default rtp (transmute (poll_waiter : fn (Ptr U8) -> Unit))
+                           (transmute (arg_slot args 0usz))
+    ptr_store (arg_slot args 1usz) (Arg rtp lg dir 0)
+    ignore (spawn_default rtp (transmute (grower : fn (Ptr U8) -> Unit))
+                              (transmute (arg_slot args 1usz)))
+    ptr_store (arg_slot args 2usz) (Arg rtp lg dir (as_i64 id))
+    ignore (spawn_default rtp (transmute (watchdog : fn (Ptr U8) -> Unit))
+                              (transmute (arg_slot args 2usz)))
+    run rtp
+
+    t.is_i64 "watch_poll: the watch knows it is a poll" (log_at lg 0usz) 1
+    t.is_i64 "watch_poll: it reported the file's new size" (log_at lg 1usz) 10
+    t.is_i64 "watch_poll: awaiting it as an event watch is refused" (log_at lg 2usz) 4
+
+    shutdown rtp
+    free_log lg
+    rt_free rtp
+    ignore (blocking fn () -> fs_unlink (path_in dir (watched_name ())))
+    ignore (blocking fn () -> fs_rmdir (dir_of dir))
+    free (transmute dir)
+    free (transmute args)
+
+// --- a watch that does not keep the loop alive --------------------------------------------------
+
+test_watch_unref (t: mut TestState): Unit =
+    rtp = rt_new ()
+    dir = new_dir_cell ()
+    ignore (blocking fn () -> fs_mkdir (dir_of dir) 493)
+    match watch_path rtp (dir_of dir) 0
+    | Error e -> t.ok ("watch_unref: no watch here (" ++ uv_error_text (ref e) ++ ")") false
+    | Ok w ->
+        t.ok "watch_unref: a fresh watch counts" (watch_has_ref w)
+        t.ok "watch_unref: and is a reason to keep running" (loop_alive (rt_loop rtp))
+        watch_unref w
+        t.ok "watch_unref: unreferenced, it stops counting" (not (watch_has_ref w))
+        t.ok "watch_unref: and the loop has nothing left to wait for"
+             (not (loop_alive (rt_loop rtp)))
+        watch_ref w
+        watch_close w
+    shutdown rtp
+    rt_free rtp
+    ignore (blocking fn () -> fs_rmdir (dir_of dir))
+    free (transmute dir)
+
+// --- the handler with no loop ---------------------------------------------------------------------
+
+test_watch_blocking (t: mut TestState): Unit =
+    rtp = rt_new ()
+    dir = new_dir_cell ()
+    ignore (blocking fn () -> fs_mkdir (dir_of dir) 493)
+    match watch_path rtp (dir_of dir) 0
+    | Error e -> t.ok ("watch_blocking: no watch here (" ++ uv_error_text (ref e) ++ ")") false
+    | Ok w ->
+        match blocking fn () -> await_change w
+        | Ok _ch -> t.ok "watch_blocking: watching with no loop fails" false
+        | Error e ->
+            t.ok "watch_blocking: watching with no loop fails" true
+            t.ok "watch_blocking: and says which way" (uv_err_name_of e.code == "ENOSYS")
+        watch_close w
+    shutdown rtp
+    rt_free rtp
+    ignore (blocking fn () -> fs_rmdir (dir_of dir))
+    free (transmute dir)
+
+run_watch_tests (t: mut TestState): Unit =
+    test_watch_event t
+    test_watch_poll t
+    test_watch_unref t
+    test_watch_blocking t

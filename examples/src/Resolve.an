@@ -7,6 +7,9 @@
 //
 // Resolution is also one of the operations `blocking` can satisfy with no loop at all, which
 // the last section shows: same call, plain libc, on main's own stack.
+//
+// Either kind of address printed below goes straight into `connect` -- the v6 ones too, which
+// was not true until `connect` learned to parse both families.
 
 import Local.Uv.Run.run_async, spawn_async
 import Local.Uv.Uv.UvError, uv_error_text

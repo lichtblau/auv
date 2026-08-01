@@ -1,0 +1,191 @@
+// Watching a path over the Async effect.
+//
+// Two ways of asking, because they are not interchangeable:
+//
+//   watch_path  is the kernel telling you -- inotify, kqueue. Immediate and nearly free, and
+//               unavailable on some filesystems, network mounts especially. It reports WHICH
+//               name changed and how.
+//   poll_path   is a stat on a timer. It works everywhere, costs a syscall per interval, and
+//               cannot see a change that is undone before the next look. It reports the file's
+//               current stat.
+//
+// Both park on the watch's own slot, so a change that happens with nobody waiting is held until
+// the next await rather than being lost -- the rule signals follow, and for the signal's exact
+// reason: nobody redelivers a filesystem event either. Two changes before either is taken
+// COALESCE into one, which is why an event says only that something changed. What it changed to
+// is a question for the filesystem, and the answer can be stale by the time you have it.
+//
+// One task per watch at a time. Two would park on one slot, which the slot refuses outright.
+//
+// Neither is offered under the `blocking` handler: watching a path is a loop watching it, and a
+// stat taken here and now would be an answer to a different question. Both report ENOSYS.
+
+import Local.Uv.Uv.Loop, copy_loop, Slot, copy_slot, slot_new,
+    Completion, copy_completion, k_cancelled, k_closed, k_fsevent,
+    UvError, uv_error_of,
+    handle_null, handle_is_null, handle_adopt_slot, handle_ref, handle_unref, handle_has_ref,
+    close_handle, close_handle_waking,
+    fs_event_new, fs_event_start, fs_poll_new, fs_poll_start,
+    fs_event_recursive, fsevent_header, fsevent_renamed, fsevent_changed,
+    buf_string_at, buf_free, as_usz
+import Local.Uv.Task.Runtime, rt_loop
+import Local.Uv.Async.Async, submit, Submission, copy_submission, sub_op2, op_watch
+import Local.Uv.Fs.FileInfo, copy_fileinfo, file_info_of
+import Std.C.malloc, free
+
+export
+    Watch, copy_watch, watch_path, poll_path, watch_is_null, watch_is_poll,
+    await_change, await_poll, watch_close, watch_free,
+    watch_ref, watch_unref, watch_has_ref,
+    Change, ch_name, ch_renamed, ch_changed,
+    watch_recursive
+
+// uv error codes this module returns for conditions libuv itself never reports.
+e_nomem (): I32 = -12
+e_badf (): I32 = -9
+e_einval (): I32 = -22
+e_cancelled (): I32 = -125
+
+/// Watch a whole tree rather than one directory, where the platform can (macOS and Windows;
+/// not Linux, where libuv reports EINVAL for it).
+watch_recursive (): I32 = fs_event_recursive ()
+
+// --- what a change is ----------------------------------------------------------------------------
+
+/// One reported change: the name it happened to, and which of the two things happened.
+///
+/// `name` is relative to the watched path when a DIRECTORY is being watched, and is the watched
+/// file's own name when a file is. It can also be empty: some platforms report that something
+/// under the path changed without saying what.
+///
+/// Not `Copy`, because it holds a String.
+type Change =
+    name: String
+    renamed: Bool
+    changed: Bool
+
+ch_name (c: ref Change): String = clone c.name
+ch_renamed (c: ref Change): Bool = c.renamed
+ch_changed (c: ref Change): Bool = c.changed
+
+// --- a watch --------------------------------------------------------------------------------------
+
+// Behind a heap cell for the reason a Stream is, and carrying which of the two kinds it is so
+// that awaiting it the wrong way is an error rather than a misread payload.
+type WatchState =
+    handle: Ptr U8
+    slot: Slot
+    is_poll: Bool
+
+type Watch = cell: Ptr WatchState
+
+impl copy_watch: Copy Watch with (.*) = deref
+
+wt_of (w: Watch): mut WatchState = ptr_to_mut w.cell
+
+new_watch (h: Ptr U8) (sl: Slot) (is_poll: Bool): Watch =
+    p: Ptr WatchState = malloc (size_of (MkType : Type WatchState))
+    ptr_store p (WatchState h sl is_poll)
+    Watch p
+
+/// Watch a file or a directory and be told when it changes. `flags` is 0, or `watch_recursive`.
+///
+/// Watching a directory reports the entries under it by name. Watching a file reports that
+/// file. An `Error` here is a platform that cannot watch this path at all -- a filesystem with
+/// no notification support -- which is the case `poll_path` exists for.
+watch_path (rtp: Ptr Runtime) (path: ref String) (flags: I32): Result Watch UvError =
+    h = fs_event_new (rt_loop rtp)
+    if handle_is_null h then Error (uv_error_of (e_nomem ()))
+    else
+        sl = slot_new ()
+        handle_adopt_slot h sl
+        r = fs_event_start h path flags
+        if r != 0 then
+            close_handle h
+            Error (uv_error_of r)
+        else Ok (new_watch h sl false)
+
+/// Stat `path` every `interval_ms` and report every change. Works where `watch_path` does not,
+/// and misses whatever is undone between two looks.
+poll_path (rtp: Ptr Runtime) (path: ref String) (interval_ms: I32): Result Watch UvError =
+    h = fs_poll_new (rt_loop rtp)
+    if handle_is_null h then Error (uv_error_of (e_nomem ()))
+    else
+        sl = slot_new ()
+        handle_adopt_slot h sl
+        r = fs_poll_start h path interval_ms
+        if r != 0 then
+            close_handle h
+            Error (uv_error_of r)
+        else Ok (new_watch h sl true)
+
+watch_is_null (w: Watch): Bool = handle_is_null (wt_of w).handle
+
+/// Which of the two kinds this is: a poll watch answers `await_poll`, an event watch
+/// `await_change`.
+watch_is_poll (w: Watch): Bool = (wt_of w).is_poll
+
+// Both awaits are the same park; only the payload differs.
+await_raw (w: Watch) (want_poll: Bool): Result Completion UvError can Async =
+    st = wt_of w
+    h = st.handle
+    if handle_is_null h then Error (uv_error_of (e_badf ()))
+    else if st.is_poll != want_poll then Error (uv_error_of (e_einval ()))
+    else
+        // The kind travels with the submission: `op_watch` serves every handle that goes on
+        // producing events, and what it rearms on is what that handle produces.
+        c = submit (sub_op2 (op_watch ()) (I64 (k_fsevent ())) h)
+        if c.kind == k_cancelled () then Error (uv_error_of (e_cancelled ()))
+        else if c.kind == k_closed () then Error (uv_error_of (e_badf ()))
+        else if c.status < 0 then Error (uv_error_of (I32 c.status))
+        else Ok c
+
+/// Wait for the next change under a `watch_path` watch.
+await_change (w: Watch): Result Change UvError can Async =
+    match await_raw w false
+    | Error e -> Error e
+    | Ok c ->
+        // The two flags are independent and either can arrive alone: a create is a rename, a
+        // write is a change, and a platform is allowed to report both at once or neither.
+        renamed = fsevent_renamed c.payload
+        changed = fsevent_changed c.payload
+        name = buf_string_at c.payload (fsevent_header ()) (as_usz c.aux)
+        buf_free c.payload
+        Ok (Change name renamed changed)
+
+/// Wait for the next change under a `poll_path` watch, and get the file's current stat with it.
+await_poll (w: Watch): Result FileInfo UvError can Async =
+    match await_raw w true
+    | Error e -> Error e
+    | Ok c ->
+        info = file_info_of c.payload
+        buf_free c.payload
+        Ok info
+
+/// Stop watching and release the handle, waking anyone parked on it first. Idempotent, and
+/// every copy of the wrapper sees it.
+watch_close (w: Watch): Unit =
+    st = wt_of w
+    if not (handle_is_null st.handle) then
+        h = st.handle
+        st.handle := handle_null ()
+        st.slot := Slot (handle_null ())
+        close_handle_waking h (k_closed ()) 0
+
+/// Same as `watch_close`: the handle owns everything underneath.
+watch_free (w: Watch): Unit = watch_close w
+
+/// Keep watching without keeping the loop alive -- what a watch that is only there to notice
+/// something wants, so that it is never the reason a program has work left.
+watch_unref (w: Watch): Unit =
+    h = (wt_of w).handle
+    if not (handle_is_null h) then handle_unref h
+
+/// Count this watch again, undoing `watch_unref`.
+watch_ref (w: Watch): Unit =
+    h = (wt_of w).handle
+    if not (handle_is_null h) then handle_ref h
+
+watch_has_ref (w: Watch): Bool =
+    h = (wt_of w).handle
+    not (handle_is_null h) and handle_has_ref h

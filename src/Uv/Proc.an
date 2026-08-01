@@ -12,8 +12,8 @@
 
 import Local.Uv.Uv.Loop, copy_loop, Slot, copy_slot, slot_new, Completion, copy_completion,
     k_exit, k_cancelled, UvError, uv_error_of,
-    handle_null, handle_is_null, handle_adopt_slot, close_handle,
-    pipe_new, process_spawn, process_kill, process_pid,
+    handle_null, handle_is_null, handle_adopt_slot, handle_unref, close_handle,
+    pipe_new, process_spawn, process_spawn_with, process_kill, process_pid,
     buf_alloc, buf_free, ptr_at, ptr_set, cstr_of_string, i32_at, as_i64
 import Local.Uv.Task.Runtime, rt_loop
 import Local.Uv.Async.Async, submit, Submission, copy_submission, sub_op2, op_wait_exit
@@ -24,7 +24,37 @@ import Std.Vec.Vec, empty, push, len
 export
     Child, copy_child, child_pid, child_stdin, child_stdout, child_stderr,
     Exit, copy_exit, exit_code, exit_signal, exited_normally,
-    spawn_child, wait_exit, kill_child, child_close, child_close_stdin
+    spawn_child, wait_exit, kill_child, child_close, child_close_stdin,
+    SpawnOpts, copy_spawnopts, spawn_opts, spawn_child_with, child_unref,
+    stdio_ignore, stdio_pipe, stdio_inherit,
+    with_stdio, with_env, with_ids, with_detached, with_cwd
+
+// --- the shim's spawn options -----------------------------------------------------------------
+// Declared here rather than in Uv.an because this module is their only caller, which is the
+// arrangement Fs.an's open flags already use: one declarer per symbol, and it is whoever needs
+// it. uv_process_options_t is a by-value aggregate holding an array of tagged unions, so it is
+// built on the C side one field at a time and never crosses the boundary.
+
+auv_spawn_opts_new      = extern "auv_spawn_opts_new":      fn Unit -> Ptr U8
+auv_spawn_opts_free     = extern "auv_spawn_opts_free":     fn (Ptr U8) -> Unit
+auv_spawn_opts_env      = extern "auv_spawn_opts_env":      fn (Ptr U8) (Ptr U8) -> Unit
+auv_spawn_opts_ids      = extern "auv_spawn_opts_ids":      fn (Ptr U8) I64 I64 -> Unit
+auv_spawn_opts_detached = extern "auv_spawn_opts_detached": fn (Ptr U8) I32 -> Unit
+auv_spawn_opts_stdio    = extern "auv_spawn_opts_stdio":    fn (Ptr U8) I32 I32 I32 (Ptr U8) -> Unit
+auv_stdio_ignore_mode   = extern "auv_stdio_ignore":        fn Unit -> I32
+auv_stdio_pipe_mode     = extern "auv_stdio_pipe":          fn Unit -> I32
+auv_stdio_inherit_mode  = extern "auv_stdio_inherit":       fn Unit -> I32
+
+/// What the child gets for one of its three standard streams.
+///
+/// `stdio_pipe` is what `spawn_child` gives all three: a pipe, and a Stream on this side.
+/// `stdio_ignore` hands it /dev/null. `stdio_inherit` hands over THIS process's own descriptor,
+/// which is the one a child that should share the terminal needs -- an editor, a pager, a
+/// program that draws. There is no Stream on this side for either of the last two, and
+/// `child_stdout` and friends answer with a null Stream.
+stdio_ignore (): I32 = auv_stdio_ignore_mode ()
+stdio_pipe (): I32 = auv_stdio_pipe_mode ()
+stdio_inherit (): I32 = auv_stdio_inherit_mode ()
 
 // --- a child --------------------------------------------------------------------------------
 
@@ -105,6 +135,135 @@ spawn_child (rtp: Ptr Runtime) (file: ref String) (args: ref Vec String): Result
             sl = slot_new ()
             handle_adopt_slot hp sl
             Ok (Child hp sl (stream_of_handle hin) (stream_of_handle hout) (stream_of_handle herr))
+
+// --- spawning with everything the platform allows ---------------------------------------------
+
+/// Everything `uv_spawn` can be told beyond the program and its arguments. Build one with
+/// `spawn_opts ()` and change it with the `with_*` functions, each of which returns a new one:
+///
+///     spawn_child_with rtp "less" args (with_stdio (spawn_opts ()) (stdio_inherit ())
+///                                                                  (stdio_inherit ())
+///                                                                  (stdio_inherit ()))
+///
+/// `Copy`, and deliberately flat: it holds no String and no Vec, so passing one costs nothing
+/// and nothing here has to be freed. The environment is the exception and travels separately.
+type SpawnOpts =
+    stdin_mode: I32
+    stdout_mode: I32
+    stderr_mode: I32
+    uid: I64
+    gid: I64
+    detached: Bool
+    inherit_env: Bool
+
+impl copy_spawnopts: Copy SpawnOpts with (.*) = deref
+
+/// Three pipes, this process's environment, its user, and not detached: what `spawn_child`
+/// does, said out loud.
+spawn_opts (): SpawnOpts =
+    SpawnOpts (stdio_pipe ()) (stdio_pipe ()) (stdio_pipe ()) (0i64 - 1i64) (0i64 - 1i64)
+              false true
+
+/// What the child gets for each of its three standard streams.
+with_stdio (o: SpawnOpts) (in_mode: I32) (out_mode: I32) (err_mode: I32): SpawnOpts =
+    SpawnOpts in_mode out_mode err_mode o.uid o.gid o.detached o.inherit_env
+
+/// Give the child an environment of its own -- `spawn_child_with` takes the entries themselves,
+/// as "NAME=value" strings; this only says to use them instead of inheriting.
+with_env (o: SpawnOpts) (use_given: Bool): SpawnOpts =
+    SpawnOpts o.stdin_mode o.stdout_mode o.stderr_mode o.uid o.gid o.detached (not use_given)
+
+/// Run the child as another user. Needs the privilege to do it; without one, `uv_spawn` fails
+/// with EPERM rather than running the program as this user by accident.
+with_ids (o: SpawnOpts) (uid: I64) (gid: I64): SpawnOpts =
+    SpawnOpts o.stdin_mode o.stdout_mode o.stderr_mode uid gid o.detached o.inherit_env
+
+/// Put the child in a process group of its own, so it can outlive this process. Pair it with
+/// `child_unref`, or the loop keeps waiting for something that was meant to be let go.
+with_detached (o: SpawnOpts) (on: Bool): SpawnOpts =
+    SpawnOpts o.stdin_mode o.stdout_mode o.stderr_mode o.uid o.gid on o.inherit_env
+
+/// Kept for symmetry with the others; the working directory is an argument to
+/// `spawn_child_with` rather than a field, because it is a String and this record is flat.
+with_cwd (o: SpawnOpts): SpawnOpts = o
+
+// One pipe per stream that asked for one, or a null handle. A stream the child should not get a
+// pipe for gets no handle at all, which is what `auv_spawn_opts_stdio` reads as "not a pipe".
+pipe_for (lp: Loop) (mode: I32): Ptr U8 =
+    if mode == stdio_pipe () then pipe_new lp false else handle_null ()
+
+// The environment as the NULL-terminated `char **` uv_spawn wants, or a null pointer to inherit.
+build_env (env: ref Vec String): Ptr U8 =
+    n = env.len
+    vec = buf_alloc ((n + 1usz) * 8usz)
+    var i = 0usz
+    while i < n do
+        ptr_set vec i (cstr_of_string (ptr_to_mut (offset env.data i)))
+        i := i + 1usz
+    ptr_set vec n (handle_null ())
+    vec
+
+free_env (vec: Ptr U8) (n: Usz): Unit =
+    var i = 0usz
+    while i < n do
+        buf_free (ptr_at vec i)
+        i := i + 1usz
+    buf_free vec
+
+/// Spawn with the options spelled out, in `cwd` (empty for this process's), with `env` as the
+/// child's environment when the options say to use it.
+///
+/// A stream set to anything but `stdio_pipe` comes back as a null Stream: there is no pipe on
+/// this side to read, which is the whole point of inheriting or ignoring one.
+spawn_child_with (rtp: Ptr Runtime) (file: ref String) (args: ref Vec String) (o: SpawnOpts) (cwd: ref String) (env: ref Vec String): Result Child UvError can Async =
+    lp = rt_loop rtp
+    hin = pipe_for lp o.stdin_mode
+    hout = pipe_for lp o.stdout_mode
+    herr = pipe_for lp o.stderr_mode
+    copts = auv_spawn_opts_new ()
+    if handle_is_null copts then
+        close_handle hin
+        close_handle hout
+        close_handle herr
+        Error (uv_error_of -12)
+    else
+        auv_spawn_opts_stdio copts 0 o.stdin_mode 0 hin
+        auv_spawn_opts_stdio copts 1 o.stdout_mode 0 hout
+        auv_spawn_opts_stdio copts 2 o.stderr_mode 0 herr
+        auv_spawn_opts_ids copts o.uid o.gid
+        auv_spawn_opts_detached copts (if o.detached then 1 else 0)
+        envv = if o.inherit_env then handle_null () else build_env env
+        if not o.inherit_env then auv_spawn_opts_env copts envv
+
+        argv = build_argv file args
+        cwdp = if cwd.length == 0u32 then handle_null () else cstr_of_string cwd
+        errcell = buf_alloc 4usz
+        hp = process_spawn_with lp (ptr_at argv 0usz) argv cwdp copts errcell
+        code = i32_at errcell 0usz
+
+        free_argv argv args.len
+        if not o.inherit_env then free_env envv env.len
+        if not (handle_is_null cwdp) then buf_free cwdp
+        buf_free errcell
+        auv_spawn_opts_free copts
+
+        if handle_is_null hp then
+            close_handle hin
+            close_handle hout
+            close_handle herr
+            Error (uv_error_of code)
+        else
+            sl = slot_new ()
+            handle_adopt_slot hp sl
+            Ok (Child hp sl (stream_or_null hin) (stream_or_null hout) (stream_or_null herr))
+
+// A Stream for a pipe that was made, or a null one for a stream the child got another way.
+stream_or_null (h: Ptr U8): Stream = if handle_is_null h then stream_null () else stream_of_handle h
+
+/// Stop this child from keeping the loop alive. What `with_detached` needs to mean anything:
+/// a child meant to outlive this process must not be a reason for it to stay.
+child_unref (c: ref Child): Unit =
+    if not (handle_is_null c.handle) then handle_unref c.handle
 
 /// Wait for the child to exit. Safe to call after its output has already been drained: the
 /// exit status waits in the process handle's slot until it is read.

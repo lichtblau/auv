@@ -5,10 +5,16 @@
 // `sleep` parks the task that calls it. Nothing else stops: while one ticker waits out its
 // interval the loop is free to wake the other two, so the three schedules interleave even
 // though each task is written as if it were the only one.
+//
+// All three ways of waiting are here: `sleep` (wait, then carry on), `sleep_unref` (the same,
+// on a timer that is not a reason for the program to stay alive) and a Ticker (a schedule that
+// keeps its own time rather than starting again from whenever the task got round to asking).
 
 import Local.Uv.Run.run_async, spawn_async
-import Local.Uv.Task.Runtime
-import Local.Uv.Async.Async, sleep
+import Local.Uv.Task.Runtime, rt_now
+import Local.Uv.Async.Async, sleep, sleep_unref
+import Local.Uv.Timer.Ticker, copy_ticker, ticker_every, await_tick, ticker_close
+import Local.Uv.Uv.UvError, uv_error_text
 
 // A ticker is identified by a number, and its schedule follows from it.
 every_ms (id: I64): U64 = if id == 1 then 120u64 else if id == 2 then 200u64 else 350u64
@@ -29,12 +35,53 @@ ticker (_rtp: Ptr Runtime) (id: I64): Unit can Async =
     print id
     println ": finished"
 
-// The first task starts the other two and then does a ticker's work itself. A spawned task
-// runs immediately, up to its first park, so by the time this returns all three are waiting
-// on their own timers.
+// A heartbeat: no end condition, and yet it does not keep the program running. `sleep_unref`
+// waits on a timer the loop does not count, so once the three tickers above have finished
+// there is nothing left to wait FOR, `run_async` returns, and this task is cancelled out of
+// its wait on the way down -- which is the false that ends the loop. Written with `sleep`, the
+// very same task would mean the program never exits at all.
+heartbeat (_rtp: Ptr Runtime) (_n: I64): Unit can Async =
+    var beats = 0
+    var going = true
+    while going do
+        going := sleep_unref 250u64
+        if going then
+            beats := beats + 1
+            print "heartbeat "
+            println beats
+
+// The same three ticks, on a Ticker instead. The difference does not show in the output and is
+// the whole reason it exists: this one is libuv's own repeat, started once and left running, so
+// the schedule does not shift when the work between two ticks takes a while. A loop around
+// `sleep` starts its next interval from whenever the task got round to asking, so every slow
+// tick pushes the rest of them later -- and they never catch up.
+//
+// `rt_now` is the loop's own clock: read once per turn and cached, so every timer that fires in
+// one turn agrees about what time it is.
+metronome (rtp: Ptr Runtime) (_n: I64): Unit can Async =
+    match ticker_every rtp 200
+    | Error e -> println ("no ticker: " ++ uv_error_text (ref e))
+    | Ok tk ->
+        started = rt_now rtp
+        var left = 3
+        while left > 0 do
+            match await_tick tk
+            | Error _e -> left := 0
+            | Ok _u ->
+                print "metronome at "
+                print (rt_now rtp - started)
+                println " ms"
+                left := left - 1
+        ticker_close tk
+
+// The first task starts the others and then does a ticker's work itself. A spawned task runs
+// immediately, up to its first park, so by the time this returns all of them are waiting on
+// their own timers.
 tickers (rtp: Ptr Runtime): Unit can Async =
     spawn_async rtp ticker 2
     spawn_async rtp ticker 3
+    spawn_async rtp heartbeat 0
+    spawn_async rtp metronome 0
     ticker rtp 1
 
 main () =

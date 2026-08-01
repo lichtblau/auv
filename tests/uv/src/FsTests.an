@@ -13,11 +13,17 @@ import Local.Uv.Uv.Completion, copy_completion, handle_is_null, loop_thread_faul
 import Local.Uv.Task.Runtime, rt_new, rt_free, rt_loop, rt_live_count,
     spawn, spawn_default, join, run, shutdown
 import Local.Uv.Async.Async, run_uv, blocking, sleep
-import Local.Uv.Fs.FileInfo, copy_fileinfo, fi_size, fi_is_dir,
+import Local.Uv.Fs.FileInfo, copy_fileinfo, fi_size, fi_is_dir, fi_mtime,
     fs_open, fs_read, fs_write, fs_close, fs_stat, fs_scandir,
     fs_mkdir, fs_rmdir, fs_unlink, fs_rename, read_file, write_file, resolve,
     DirEntry, fs_scandir_entries,
-    o_rdonly, o_wronly, o_creat, o_trunc
+    o_rdonly, o_wronly, o_rdwr, o_creat, o_trunc,
+    FsInfo, copy_fsinfo, fst_block_size, fst_blocks,
+    f_ok, x_ok, copyfile_excl,
+    fs_fsync, fs_fdatasync, fs_ftruncate, fs_lstat, fs_fstat, fs_access, fs_exists, fs_chmod,
+    fs_chown, fs_utime, fs_link, fs_symlink, fs_readlink, fs_realpath, fs_copyfile,
+    fs_mkdtemp, fs_statfs,
+    NameInfo, ni_host, ni_service, reverse_lookup
 import Std.Vec.Vec, empty, push, len
 import Std.C.malloc, free
 import Std.String.eq_string
@@ -469,11 +475,235 @@ test_fs_current_position (t: mut TestState): Unit =
     free (transmute args)
     free (transmute dir)
 
+// --- the second batch, both ways ----------------------------------------------------------------
+//
+// Seventeen operations in one pass, each contributing one bit to the answer, so a failure names
+// itself: the difference between the mask that comes back and `ext_bits` is exactly the check
+// that went wrong. Run once against the loop and once under `blocking`, because "the same
+// program under all three handlers" is the promise this batch has to keep -- and two of them
+// are not the same call underneath (there is no libc copyfile, and statvfs carries no
+// filesystem type), which is precisely why both sides are checked.
+
+// Fresh strings rather than reused bindings: `++` and `==` consume, and a path used a dozen
+// times is easier to hand out again than to clone at each site.
+p_one (dir: Ptr String): String = path_in dir "one.txt"
+p_copy (dir: Ptr String): String = path_in dir "copy.txt"
+p_hard (dir: Ptr String): String = path_in dir "hard.txt"
+p_sym (dir: Ptr String): String = path_in dir "sym.lnk"
+p_missing (dir: Ptr String): String = path_in dir "nope.txt"
+p_template (dir: Ptr String): String = path_in dir "tmpXXXXXX"
+ext_body (): String = "0123456789"
+
+// Seventeen checks, all of them.
+ext_bits (): I64 = 131071
+
+// uid and gid "leave as they are", which is a real chown that needs no privilege.
+no_change (): I64 = 0i64 - 1i64
+
+extended_probe (dir: Ptr String): I64 can Async =
+    // Whatever an earlier run left behind, then an empty directory and one known file.
+    ignore (fs_unlink (p_one dir))
+    ignore (fs_unlink (p_copy dir))
+    ignore (fs_unlink (p_hard dir))
+    ignore (fs_unlink (p_sym dir))
+    ignore (fs_rmdir (dir_of dir))
+    ignore (fs_mkdir (dir_of dir) 493)                 // 0755
+    ignore (write_file (p_one dir) (ext_body ()))
+    var m = 0
+
+    // Reachability, both answers.
+    match fs_access (p_one dir) (f_ok ())
+    | Ok _u -> m := m + 1
+    | Error _e -> ()
+    if not (fs_exists (p_missing dir)) then m := m + 2
+
+    // Everything that needs an open descriptor.
+    match fs_open (p_one dir) (o_rdwr ()) 0
+    | Error _e -> ()
+    | Ok fd ->
+        var synced = true
+        match fs_fsync fd
+        | Ok _u -> ()
+        | Error _e -> synced := false
+        match fs_fdatasync fd
+        | Ok _u -> ()
+        | Error _e -> synced := false
+        if synced then m := m + 4
+        match fs_fstat fd
+        | Error _e -> ()
+        | Ok byfd ->
+            match fs_stat (p_one dir)
+            | Error _e -> ()
+            | Ok bypath -> if fi_size byfd == fi_size bypath then m := m + 8
+        match fs_ftruncate fd 4
+        | Error _e -> ()
+        | Ok _u ->
+            match fs_stat (p_one dir)
+            | Error _e -> ()
+            | Ok cut -> if fi_size cut == 4 then m := m + 16
+        ignore (fs_close fd)
+
+    // Permissions, asked as a question about what is allowed rather than about mode bits --
+    // which is also the one form of the question that answers the same way for root.
+    match fs_chmod (p_one dir) 384                     // 0600
+    | Error _e -> ()
+    | Ok _u ->
+        match fs_access (p_one dir) (x_ok ())
+        | Error _e -> m := m + 32
+        | Ok _u -> ()
+    match fs_chmod (p_one dir) 448                     // 0700
+    | Error _e -> ()
+    | Ok _u ->
+        match fs_access (p_one dir) (x_ok ())
+        | Ok _u -> m := m + 64
+        | Error _e -> ()
+
+    // Ownership, changed to what it already is.
+    match fs_chown (p_one dir) (no_change ()) (no_change ())
+    | Ok _u -> m := m + 65536
+    | Error _e -> ()
+
+    // A symbolic link, read back exactly as it was written.
+    match fs_symlink (p_one dir) (p_sym dir)
+    | Error _e -> ()
+    | Ok _u ->
+        match fs_readlink (p_sym dir)
+        | Error _e -> ()
+        | Ok target -> if target == p_one dir then m := m + 128
+        // lstat is about the LINK, and a link's size is the length of what it points at.
+        match fs_lstat (p_sym dir)
+        | Error _e -> ()
+        | Ok linfo ->
+            if fi_size linfo == as_i64 (U64 (Usz (p_one dir).length)) then m := m + 256
+
+    // A second name for the same file.
+    match fs_link (p_one dir) (p_hard dir)
+    | Error _e -> ()
+    | Ok _u ->
+        match fs_stat (p_hard dir)
+        | Error _e -> ()
+        | Ok hinfo -> if fi_size hinfo == 4 then m := m + 512
+
+    // A copy, and then a copy that must refuse.
+    match fs_copyfile (p_one dir) (p_copy dir) 0
+    | Error _e -> ()
+    | Ok _u ->
+        match read_file (p_copy dir)
+        | Error _e -> ()
+        | Ok copied -> if copied == "0123" then m := m + 1024
+        match fs_copyfile (p_one dir) (p_copy dir) (copyfile_excl ())
+        | Error _e -> m := m + 2048
+        | Ok _u -> ()
+
+    // realpath, checked against itself: whether /tmp is a symlink on this machine cancels out.
+    match fs_realpath (p_one dir)
+    | Error _e -> ()
+    | Ok full ->
+        match fs_realpath (dir_of dir)
+        | Error _e -> ()
+        | Ok base -> if full == base ++ "/one.txt" then m := m + 4096
+
+    match fs_utime (p_one dir) 1000000000 1000000000
+    | Error _e -> ()
+    | Ok _u ->
+        match fs_stat (p_one dir)
+        | Error _e -> ()
+        | Ok timed -> if fi_mtime timed == 1000000000 then m := m + 8192
+
+    match fs_mkdtemp (p_template dir)
+    | Error _e -> ()
+    | Ok made ->
+        match fs_stat made
+        | Error _e -> ()
+        | Ok minfo -> if fi_is_dir minfo then m := m + 16384
+        ignore (fs_rmdir made)
+
+    match fs_statfs (dir_of dir)
+    | Error _e -> ()
+    | Ok fsi -> if fst_block_size fsi > 0 and fst_blocks fsi > 0 then m := m + 32768
+
+    ignore (fs_unlink (p_one dir))
+    ignore (fs_unlink (p_copy dir))
+    ignore (fs_unlink (p_hard dir))
+    ignore (fs_unlink (p_sym dir))
+    ignore (fs_rmdir (dir_of dir))
+    m
+
+extended_task (p: Ptr U8): Unit =
+    arg = farg_of p
+    log_push arg.log (run_uv arg.rt fn () -> extended_probe arg.dir)
+
+test_fs_extended (t: mut TestState): Unit =
+    dir = new_dir_cell ()
+    t.is_i64 "fs_extended: every operation answered under blocking"
+             (blocking fn () -> extended_probe dir) (ext_bits ())
+
+    rtp = rt_new ()
+    lg = new_log ()
+    args = new_fargs 1usz
+    ptr_store (farg_slot args 0usz) (FArg rtp lg dir 0)
+    ignore (spawn_default rtp (transmute (extended_task : fn (Ptr U8) -> Unit))
+                              (transmute (farg_slot args 0usz)))
+    run rtp
+    t.is_i64 "fs_extended: and the same on the loop" (log_at lg 0usz) (ext_bits ())
+    t.is_i64 "fs_extended: no completion off the loop thread"
+             (loop_thread_faults (rt_loop rtp)) 0
+
+    shutdown rtp
+    rt_free rtp
+    free_log lg
+    free (transmute args)
+    free (transmute dir)
+
+// --- the other direction ---------------------------------------------------------------------
+//
+// An address back to a name. The assertion is deliberately not "127.0.0.1 is localhost" -- that
+// is the machine's /etc/hosts talking and a container may disagree -- but that an answer comes
+// back at all and that BOTH handlers give the same one. The twin property is the one this
+// binding is responsible for.
+
+reverse_probe (out: Ptr String): Bool can Async =
+    match reverse_lookup "127.0.0.1" 0
+    | Error _e -> false
+    | Ok ni ->
+        ptr_store out (ni_host (ref ni))
+        (ni_host (ref ni)).length > 0u32
+
+reverse_task (p: Ptr U8): Unit =
+    arg = farg_of p
+    log_push arg.log (if run_uv arg.rt fn () -> reverse_probe arg.dir then 1 else 0)
+
+test_reverse_lookup (t: mut TestState): Unit =
+    from_blocking = new_dir_cell ()
+    t.ok "reverse_lookup: an address resolves back under blocking"
+         (blocking fn () -> reverse_probe from_blocking)
+
+    rtp = rt_new ()
+    lg = new_log ()
+    from_loop = new_dir_cell ()
+    args = new_fargs 1usz
+    ptr_store (farg_slot args 0usz) (FArg rtp lg from_loop 0)
+    ignore (spawn_default rtp (transmute (reverse_task : fn (Ptr U8) -> Unit))
+                              (transmute (farg_slot args 0usz)))
+    run rtp
+    t.is_i64 "reverse_lookup: and on the loop" (log_at lg 0usz) 1
+    t.ok "reverse_lookup: both handlers said the same thing"
+         (dir_of from_loop == dir_of from_blocking)
+
+    shutdown rtp
+    rt_free rtp
+    free_log lg
+    free (transmute args)
+    free (transmute from_loop)
+    free (transmute from_blocking)
+
 run_fs_tests (t: mut TestState): Unit =
     test_round_trip t
     test_scandir t
     test_scandir_types t
     test_resolve t
     test_fs_blocking t
+    test_fs_extended t
+    test_reverse_lookup t
     test_fs_current_position t
     test_fs_storm t

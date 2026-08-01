@@ -9,7 +9,7 @@ import Local.Uv.Uv.Completion, copy_completion, completion_none, k_timer, k_none
 import Local.Uv.Task.Runtime, rt_new, rt_free, rt_loop, rt_live_count, rt_task_count,
     spawn_default, run, shutdown, cancel, current_id, sleep_ms
 import Local.Uv.Async.Async, submit, Submission, copy_submission, sub_op1, op_sleep, op_none,
-    run_uv, blocking, mock, sleep, sleep_result, perform_blocking
+    run_uv, blocking, mock, sleep, sleep_result, sleep_unref, perform_blocking
 import Std.Vec.Vec, empty, push, len
 import Std.C.malloc, free
 // Std.Throw declares its own Result (Ok/Err), distinct from the prelude's Ok/Error;
@@ -236,6 +236,60 @@ test_cancel_through_effect (t: mut TestState): Unit =
     free_log lg
     free (transmute args)
 
+// --- a heartbeat nobody waits for ---------------------------------------------------------------
+//
+// `sleep_unref` waits on a timer that does not keep the loop alive, so a task that ticks
+// FOREVER is not a reason for `run` to keep going. Written with `sleep` instead, the same loop
+// would make `run` never return -- which is why this test is the whole point of unreferencing:
+// a program can hold a background watcher and still finish.
+
+// Ticks until somebody cancels the wait, which is what `sleep_unref` returning false means.
+heartbeat (p: Ptr U8): Unit =
+    arg = arg_of p
+    run_uv arg.rt fn () ->
+        var going = true
+        while going do
+            going := sleep_unref 20u64
+            if going then log_of arg.log 7
+
+// The only task with real work: 150 ms of it, several heartbeats long.
+one_job (p: Ptr U8): Unit =
+    arg = arg_of p
+    run_uv arg.rt fn () ->
+        sleep 150u64
+        log_of arg.log 1
+
+test_unref_heartbeat (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    args = new_args 2usz
+    ptr_store (arg_slot args 0usz) (Arg rtp lg 0 0)
+    ignore (spawn_default rtp (transmute (heartbeat : fn (Ptr U8) -> Unit))
+                              (transmute (arg_slot args 0usz)))
+    ptr_store (arg_slot args 1usz) (Arg rtp lg 0 0)
+    ignore (spawn_default rtp (transmute (one_job : fn (Ptr U8) -> Unit))
+                              (transmute (arg_slot args 1usz)))
+    // Returns as soon as the job is done: the heartbeat is still parked, and does not count.
+    run rtp
+
+    var beats = 0usz
+    var job_done = false
+    var i = 0usz
+    while i < log_len lg do
+        if log_at lg i == 7 then beats := beats + 1usz
+        if log_at lg i == 1 then job_done := true
+        i := i + 1usz
+    t.ok "unref_heartbeat: the job finished" job_done
+    t.ok "unref_heartbeat: the heartbeat really was ticking" (beats >= 2usz)
+    t.is_usz "unref_heartbeat: run returned with it still parked" (rt_live_count rtp) 1usz
+
+    // And it is cancelled out of its wait on the way down, exactly like any other parked task.
+    shutdown rtp
+    t.is_usz "unref_heartbeat: shutdown emptied the task table" (rt_task_count rtp) 0usz
+    rt_free rtp
+    free_log lg
+    free (transmute args)
+
 // --- payload sizes --------------------------------------------------------------------------------
 
 // A submission and a completion travel through the effect machinery's fixed-size argument
@@ -261,3 +315,4 @@ run_async_tests (t: mut TestState): Unit =
     test_three_handlers t
     test_row_composition t
     test_cancel_through_effect t
+    test_unref_heartbeat t

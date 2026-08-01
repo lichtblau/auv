@@ -1,0 +1,362 @@
+// Datagram suite: two sockets on the loopback, talking to each other in one process.
+//
+// Both bind to port 0 and ask the kernel which port they got, so nothing here collides with
+// anything else on the machine.
+
+import Local.Harness.TestState, ok, is_i32, is_i64, is_usz
+import Local.Uv.Uv.UvError, uv_error_text, uv_err_name_of, handle_is_null, loop_alive,
+    loop_thread_faults, as_i64, as_u64
+import Local.Uv.Task.Runtime, rt_new, rt_free, rt_loop, rt_live_count, rt_task_count,
+    spawn_default, run, shutdown, sleep_ms
+import Local.Uv.Async.Async, run_uv, blocking, sleep
+import Local.Uv.Udp.Udp, copy_udp, udp_socket, udp_local_port, udp_close,
+    udp_recv, udp_send, udp_ref, udp_unref, udp_has_ref,
+    udp_try_send_to, udp_connect_to, udp_disconnect, udp_send_to_peer,
+    udp_local_addr, udp_peer, udp_peer_at,
+    udp_broadcast, udp_ttl, udp_multicast_loop, udp_multicast_ttl,
+    udp_join_group, udp_leave_group,
+    Datagram, dg_from, dg_port, dg_data
+import Std.Vec.Vec, empty, push, len
+import Std.C.malloc, free
+import Std.String.eq_string
+
+export run_udp_tests
+
+// --- shared shapes ---------------------------------------------------------------------------
+
+type Arg =
+    rt: Ptr Runtime
+    log: Ptr (Vec I64)
+    a: I64
+    b: I64
+    sock: Ptr Udp
+
+impl copy_uarg: Copy Arg with (.*) = deref
+
+arg_of (p: Ptr U8): Arg = deref_ptr (transmute p : Ptr Arg)
+
+log_push (a: Arg) (v: I64): Unit =
+    lg = ptr_to_mut a.log
+    lg.push v
+
+new_log (): Ptr (Vec I64) =
+    p: Ptr (Vec I64) = malloc (size_of (MkType : Type (Vec I64)))
+    ptr_store p (Vec.empty ())
+    p
+
+log_at (p: Ptr (Vec I64)) (i: Usz): I64 =
+    lg = ptr_to_mut p
+    if i >= lg.len then -1 else deref_ptr (offset lg.data i)
+
+log_len (p: Ptr (Vec I64)): Usz = (ptr_to_mut p).len
+
+free_log (p: Ptr (Vec I64)): Unit =
+    lg = ptr_to_mut p
+    if not (handle_is_null (transmute lg.data)) then free (transmute lg.data)
+    free (transmute p)
+
+new_args (n: Usz): Ptr Arg = malloc (n * size_of (MkType : Type Arg))
+arg_slot (base: Ptr Arg) (i: Usz): Ptr Arg = offset base i
+
+new_sock_cell (): Ptr Udp = malloc (size_of (MkType : Type Udp))
+
+// --- a question and an answer -------------------------------------------------------------------
+
+// Take one datagram, check who it came from, and send the same bytes back to them. Everything
+// the responder needs to reply is IN the datagram, which is the whole difference from a stream.
+responder (p: Ptr U8): Unit =
+    arg = arg_of p
+    run_uv arg.rt fn () ->
+        match udp_recv (deref_ptr arg.sock)
+        | Error _e -> log_push arg -1
+        | Ok d ->
+            log_push arg (if dg_data (ref d) == "ping" then 1 else -2)
+            log_push arg (if dg_from (ref d) == "127.0.0.1" then 1 else -3)
+            log_push arg (if dg_port (ref d) == I32 arg.a then 1 else -4)
+            match udp_send (deref_ptr arg.sock) "pong" "127.0.0.1" (I32 arg.a)
+            | Ok _u -> ()
+            | Error _e -> log_push arg -5
+
+// Send to the responder's port (arg.a) and wait for the answer.
+asker (p: Ptr U8): Unit =
+    arg = arg_of p
+    run_uv arg.rt fn () ->
+        match udp_send (deref_ptr arg.sock) "ping" "127.0.0.1" (I32 arg.a)
+        | Error _e -> log_push arg -6
+        | Ok _u ->
+            match udp_recv (deref_ptr arg.sock)
+            | Error _e -> log_push arg -7
+            | Ok d -> log_push arg (if dg_data (ref d) == "pong" then 2 else -8)
+
+test_udp_round_trip (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    here = new_sock_cell ()
+    there = new_sock_cell ()
+
+    match udp_socket rtp "127.0.0.1" 0
+    | Error e -> t.ok ("udp: binding the asker failed: " ++ uv_error_text (ref e)) false
+    | Ok a ->
+        match udp_socket rtp "127.0.0.1" 0
+        | Error e -> t.ok ("udp: binding the responder failed: " ++ uv_error_text (ref e)) false
+        | Ok b ->
+            ptr_store here a
+            ptr_store there b
+            aport = udp_local_port a
+            bport = udp_local_port b
+            t.ok "udp: the kernel picked a port for each" (aport > 0 and bport > 0)
+
+            args = new_args 2usz
+            // Each side is told the OTHER's port; each finds out the sender's from the datagram.
+            ptr_store (arg_slot args 0usz) (Arg rtp lg (I64 aport) 0 there)
+            ignore (spawn_default rtp (transmute (responder : fn (Ptr U8) -> Unit))
+                                      (transmute (arg_slot args 0usz)))
+            ptr_store (arg_slot args 1usz) (Arg rtp lg (I64 bport) 0 here)
+            ignore (spawn_default rtp (transmute (asker : fn (Ptr U8) -> Unit))
+                                      (transmute (arg_slot args 1usz)))
+            run rtp
+
+            t.is_usz "udp: both sides reported" (log_len lg) 4usz
+            t.is_i64 "udp: the datagram arrived whole" (log_at lg 0usz) 1
+            t.is_i64 "udp: carrying its sender's address" (log_at lg 1usz) 1
+            t.is_i64 "udp: and its sender's port" (log_at lg 2usz) 1
+            t.is_i64 "udp: the answer came back" (log_at lg 3usz) 2
+            t.is_i64 "udp: no completion off the loop thread"
+                     (loop_thread_faults (rt_loop rtp)) 0
+            udp_close a
+            udp_close b
+            free (transmute args)
+
+    shutdown rtp
+    free_log lg
+    rt_free rtp
+    free (transmute here)
+    free (transmute there)
+
+// --- a datagram that arrives while nobody is waiting -----------------------------------------------
+//
+// The receiver takes one and then goes away for 150 ms. The second datagram lands in that gap,
+// with no reader parked -- so the shim stops receiving and the kernel holds it, and the next
+// `udp_recv` finds it there. Losing it would be the failure this checks for.
+
+slow_receiver (p: Ptr U8): Unit =
+    arg = arg_of p
+    run_uv arg.rt fn () ->
+        match udp_recv (deref_ptr arg.sock)
+        | Error _e -> log_push arg -1
+        | Ok d -> log_push arg (if dg_data (ref d) == "first" then 1 else -2)
+        sleep 150u64
+        match udp_recv (deref_ptr arg.sock)
+        | Error _e -> log_push arg -3
+        | Ok d2 -> log_push arg (if dg_data (ref d2) == "second" then 2 else -4)
+
+// Send one, wait for the receiver to have taken it and gone to sleep, then send the other.
+burst_sender (p: Ptr U8): Unit =
+    arg = arg_of p
+    run_uv arg.rt fn () ->
+        ignore (udp_send (deref_ptr arg.sock) "first" "127.0.0.1" (I32 arg.a))
+        sleep 50u64
+        ignore (udp_send (deref_ptr arg.sock) "second" "127.0.0.1" (I32 arg.a))
+
+test_udp_held_datagram (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    here = new_sock_cell ()
+    there = new_sock_cell ()
+
+    match udp_socket rtp "127.0.0.1" 0
+    | Error e -> t.ok ("udp_held: binding the sender failed: " ++ uv_error_text (ref e)) false
+    | Ok a ->
+        match udp_socket rtp "127.0.0.1" 0
+        | Error e -> t.ok ("udp_held: binding the receiver failed: " ++ uv_error_text (ref e)) false
+        | Ok b ->
+            ptr_store here a
+            ptr_store there b
+            args = new_args 2usz
+            ptr_store (arg_slot args 0usz) (Arg rtp lg 0 0 there)
+            ignore (spawn_default rtp (transmute (slow_receiver : fn (Ptr U8) -> Unit))
+                                      (transmute (arg_slot args 0usz)))
+            ptr_store (arg_slot args 1usz) (Arg rtp lg (I64 (udp_local_port b)) 0 here)
+            ignore (spawn_default rtp (transmute (burst_sender : fn (Ptr U8) -> Unit))
+                                      (transmute (arg_slot args 1usz)))
+            run rtp
+
+            t.is_usz "udp_held: the receiver took two" (log_len lg) 2usz
+            t.is_i64 "udp_held: the first while it was parked" (log_at lg 0usz) 1
+            t.is_i64 "udp_held: the second, sent while it was not" (log_at lg 1usz) 2
+            udp_close a
+            udp_close b
+            free (transmute args)
+
+    shutdown rtp
+    free_log lg
+    rt_free rtp
+    free (transmute here)
+    free (transmute there)
+
+// --- a socket with a fixed peer ------------------------------------------------------------------
+//
+// Connecting a datagram socket is not a handshake and says nothing to the other end: it fixes
+// the destination locally, so sends need no address and the kernel drops datagrams from anyone
+// else. `udp_send_to_peer` is the send that goes with it -- passing an address to a connected
+// socket is an error, which is why it is a separate call rather than an empty argument.
+
+connected_sender (p: Ptr U8): Unit =
+    arg = arg_of p
+    run_uv arg.rt fn () ->
+        sock = deref_ptr arg.sock
+        match udp_connect_to sock "127.0.0.1" (I32 arg.a)
+        | Error _e -> log_push arg -1
+        | Ok _u ->
+            log_push arg (if udp_peer sock == "127.0.0.1" then 1 else -2)
+            log_push arg (if udp_peer_at sock == I32 arg.a then 1 else -3)
+            match udp_send_to_peer sock "connected"
+            | Ok _u -> log_push arg 1
+            | Error _e -> log_push arg -4
+            // Try-send takes the same "no address" shape, and goes now or not at all.
+            match udp_try_send_to sock "" "" 0
+            | Ok _u -> log_push arg 1
+            | Error _e -> log_push arg -5
+            // Disconnected again, an address is required once more.
+            match udp_disconnect sock
+            | Ok _u -> log_push arg (if udp_peer sock == "" then 1 else -6)
+            | Error _e -> log_push arg -7
+
+connected_receiver (p: Ptr U8): Unit =
+    arg = arg_of p
+    run_uv arg.rt fn () ->
+        match udp_recv (deref_ptr arg.sock)
+        | Error _e -> log_push arg -8
+        | Ok d -> log_push arg (if dg_data (ref d) == "connected" then 30 else -9)
+        // The empty datagram the try-send put on the wire. An empty one is a real one.
+        match udp_recv (deref_ptr arg.sock)
+        | Error _e -> log_push arg -10
+        | Ok d2 -> log_push arg (if dg_data (ref d2) == "" then 31 else -11)
+
+test_udp_connected (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    here = new_sock_cell ()
+    there = new_sock_cell ()
+
+    match udp_socket rtp "127.0.0.1" 0
+    | Error e -> t.ok ("udp_connected: bind: " ++ uv_error_text (ref e)) false
+    | Ok a ->
+        match udp_socket rtp "127.0.0.1" 0
+        | Error e -> t.ok ("udp_connected: bind: " ++ uv_error_text (ref e)) false
+        | Ok b ->
+            ptr_store here a
+            ptr_store there b
+            t.ok "udp_connected: an unconnected socket has no peer" (udp_peer a == "")
+            t.ok "udp_connected: and reports where it is bound" (udp_local_addr a == "127.0.0.1")
+            args = new_args 2usz
+            ptr_store (arg_slot args 0usz) (Arg rtp lg 0 0 there)
+            ignore (spawn_default rtp (transmute (connected_receiver : fn (Ptr U8) -> Unit))
+                                      (transmute (arg_slot args 0usz)))
+            ptr_store (arg_slot args 1usz) (Arg rtp lg (I64 (udp_local_port b)) 0 here)
+            ignore (spawn_default rtp (transmute (connected_sender : fn (Ptr U8) -> Unit))
+                                      (transmute (arg_slot args 1usz)))
+            run rtp
+
+            var ok_count = 0usz
+            var got_data = false
+            var got_empty = false
+            var k = 0usz
+            while k < log_len lg do
+                if log_at lg k == 1 then ok_count := ok_count + 1usz
+                if log_at lg k == 30 then got_data := true
+                if log_at lg k == 31 then got_empty := true
+                k := k + 1usz
+            t.is_usz "udp_connected: every step of the connected socket worked" ok_count 5usz
+            t.ok "udp_connected: the datagram arrived without an address" got_data
+            t.ok "udp_connected: and so did the try-sent one" got_empty
+            udp_close a
+            udp_close b
+            free (transmute args)
+
+    shutdown rtp
+    free_log lg
+    rt_free rtp
+    free (transmute here)
+    free (transmute there)
+
+// --- the knobs -----------------------------------------------------------------------------------
+//
+// Set on the socket rather than passed per datagram. Nothing here sends anything: what is being
+// checked is that each one reaches the kernel and is accepted, which is all a binding can
+// promise -- whether a broadcast actually goes anywhere is the network's business.
+
+test_udp_options (t: mut TestState): Unit =
+    rtp = rt_new ()
+    match udp_socket rtp "0.0.0.0" 0
+    | Error e -> t.ok ("udp_options: bind: " ++ uv_error_text (ref e)) false
+    | Ok u ->
+        match udp_broadcast u true
+        | Ok _x -> t.ok "udp_options: broadcast" true
+        | Error e -> t.ok ("udp_options: broadcast: " ++ uv_error_text (ref e)) false
+        match udp_ttl u 4
+        | Ok _x -> t.ok "udp_options: ttl" true
+        | Error e -> t.ok ("udp_options: ttl: " ++ uv_error_text (ref e)) false
+        match udp_multicast_loop u false
+        | Ok _x -> t.ok "udp_options: multicast loop" true
+        | Error e -> t.ok ("udp_options: multicast loop: " ++ uv_error_text (ref e)) false
+        match udp_multicast_ttl u 1
+        | Ok _x -> t.ok "udp_options: multicast ttl" true
+        | Error e -> t.ok ("udp_options: multicast ttl: " ++ uv_error_text (ref e)) false
+        // Joining the all-hosts group on whatever interface the routing table picks, then
+        // leaving it again. A machine with no multicast route says so, and that is not this
+        // binding's failure -- so the pair is checked for agreement rather than for success.
+        joined = match udp_join_group u "224.0.0.1" ""
+                 | Ok _x -> true
+                 | Error _e -> false
+        left = match udp_leave_group u "224.0.0.1" ""
+               | Ok _x -> true
+               | Error _e -> false
+        t.ok "udp_options: joining and leaving a group agree" (joined == left)
+        udp_close u
+    shutdown rtp
+    rt_free rtp
+
+// --- a socket that does not keep the loop alive ------------------------------------------------
+
+test_udp_unref (t: mut TestState): Unit =
+    rtp = rt_new ()
+    match udp_socket rtp "127.0.0.1" 0
+    | Error e -> t.ok ("udp_unref: bind failed: " ++ uv_error_text (ref e)) false
+    | Ok u ->
+        t.ok "udp_unref: a fresh socket counts" (udp_has_ref u)
+        udp_unref u
+        t.ok "udp_unref: unreferenced, it stops counting" (not (udp_has_ref u))
+        t.ok "udp_unref: and the loop has nothing left to wait for"
+             (not (loop_alive (rt_loop rtp)))
+        udp_ref u
+        udp_close u
+    shutdown rtp
+    rt_free rtp
+
+// --- the handler with no loop ---------------------------------------------------------------------
+
+// Neither half of a datagram socket is offered under `blocking`: recvfrom with no deadline is
+// the freeze parking exists to remove, and a send that worked while the receive did not would
+// only move the failure somewhere less obvious.
+test_udp_blocking (t: mut TestState): Unit =
+    rtp = rt_new ()
+    match udp_socket rtp "127.0.0.1" 0
+    | Error e -> t.ok ("udp_blocking: bind failed: " ++ uv_error_text (ref e)) false
+    | Ok u ->
+        match blocking fn () -> udp_send u "hello" "127.0.0.1" 9
+        | Ok _x -> t.ok "udp_blocking: sending with no loop fails" false
+        | Error e ->
+            t.ok "udp_blocking: sending with no loop fails" true
+            t.ok "udp_blocking: and says which way" (uv_err_name_of e.code == "ENOSYS")
+        udp_close u
+    shutdown rtp
+    rt_free rtp
+
+run_udp_tests (t: mut TestState): Unit =
+    test_udp_round_trip t
+    test_udp_held_datagram t
+    test_udp_connected t
+    test_udp_options t
+    test_udp_unref t
+    test_udp_blocking t

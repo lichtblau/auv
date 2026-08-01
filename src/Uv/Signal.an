@@ -1,0 +1,138 @@
+// Signals over the Async effect: a watch a task can park on.
+//
+// A signal watch is a resource, not an event: it is created once, watches from then on, and a
+// task awaits it as often as it likes. That is why `await_signal` parks on the WATCH's slot
+// rather than the task's -- the same rule `accept` follows, and for the same reason. A signal
+// that arrives with nobody parked is held by the watch until the next `await_signal` takes it,
+// so a task that goes off to do work between two waits misses nothing that happened while it
+// was away.
+//
+// What it does do is COALESCE, which is the honest reading of a signal anyway: two SIGINTs
+// arriving before either is taken are one completion, because the slot holds one and drops the
+// rest. Nothing here counts signals; it reports that one arrived, and which.
+//
+// One task at a time per watch. Two would park on one slot, which the slot refuses outright --
+// a program that wants two waiters wants two watches.
+//
+// Watching a signal REPLACES its default disposition for as long as the watch is open, which is
+// the point for SIGINT: without one, Ctrl-C kills the process wherever it happens to be, and
+// with one it becomes an ordinary completion a task can act on. Closing the watch puts the
+// default back.
+//
+// The loop keeps running while a watch is open, so a program whose watch is only there to shut
+// it DOWN should `signal_unref` it: otherwise the shutdown watcher is itself the reason the
+// program never finishes.
+
+import Local.Uv.Uv.Loop, copy_loop, Slot, copy_slot, slot_new,
+    Completion, copy_completion, k_cancelled, k_closed,
+    UvError, uv_error_of,
+    handle_null, handle_is_null, handle_adopt_slot, handle_ref, handle_unref, handle_has_ref,
+    close_handle, close_handle_waking,
+    signal_new, signal_start, sigint, sigterm, sigusr1, sigusr2
+import Local.Uv.Task.Runtime, rt_loop
+import Local.Uv.Async.Async, submit, Submission, copy_submission, sub_op2, op_signal
+import Std.C.malloc, free
+
+export
+    Signal, copy_signal, signal_watch, signal_signum, signal_is_null,
+    await_signal, signal_close, signal_free,
+    signal_ref, signal_unref, signal_has_ref,
+    sig_int, sig_term, sig_usr1, sig_usr2
+
+// uv error codes this module returns for conditions libuv itself never reports.
+e_nomem (): I32 = -12
+e_badf (): I32 = -9
+e_cancelled (): I32 = -125
+
+// --- a watch ---------------------------------------------------------------------------------
+
+// Behind a heap cell for the reason a Stream is: the wrapper is `Copy` and travels through
+// argument records, so closing through one copy has to be visible to every other copy. The
+// handle and its slot are released by libuv's close callback, on a later loop turn than any
+// callback that might still be reading them.
+type SignalState =
+    handle: Ptr U8
+    slot: Slot
+    signum: I32
+
+type Signal = cell: Ptr SignalState
+
+impl copy_signal: Copy Signal with (.*) = deref
+
+sg_of (s: Signal): mut SignalState = ptr_to_mut s.cell
+
+new_signal (h: Ptr U8) (sl: Slot) (signum: I32): Signal =
+    p: Ptr SignalState = malloc (size_of (MkType : Type SignalState))
+    ptr_store p (SignalState h sl signum)
+    Signal p
+
+/// Start watching `signum`. The watch is live from here: a signal that arrives before anything
+/// awaits it is held, not lost.
+signal_watch (rtp: Ptr Runtime) (signum: I32): Result Signal UvError =
+    h = signal_new (rt_loop rtp)
+    if handle_is_null h then Error (uv_error_of (e_nomem ()))
+    else
+        sl = slot_new ()
+        handle_adopt_slot h sl
+        r = signal_start h signum
+        if r != 0 then
+            close_handle h
+            Error (uv_error_of r)
+        else Ok (new_signal h sl signum)
+
+signal_signum (s: Signal): I32 = (sg_of s).signum
+signal_is_null (s: Signal): Bool = handle_is_null (sg_of s).handle
+
+/// Park until the signal arrives, and return its number.
+///
+/// The number is the one the watch was created with, and returning it rather than `Unit` is
+/// what lets one task hold several watches and act on whichever fired. An `Error` means the
+/// wait ended some other way: the task was cancelled, the watch was closed underneath it, or --
+/// under the `blocking` handler, which has no loop to watch with -- that there is no such thing
+/// as awaiting a signal here at all (ENOSYS).
+await_signal (s: Signal): Result I32 UvError can Async =
+    h = (sg_of s).handle
+    if handle_is_null h then Error (uv_error_of (e_badf ()))
+    else
+        c = submit (sub_op2 (op_signal ()) 0 h)
+        if c.kind == k_cancelled () then Error (uv_error_of (e_cancelled ()))
+        else if c.kind == k_closed () then Error (uv_error_of (e_badf ()))
+        else if c.status < 0 then Error (uv_error_of (I32 c.status))
+        else Ok (I32 c.status)
+
+/// Stop watching and release the handle, waking anyone parked on it first. Idempotent, and
+/// every copy of the wrapper sees it. The signal's default disposition comes back with it.
+signal_close (s: Signal): Unit =
+    st = sg_of s
+    if not (handle_is_null st.handle) then
+        h = st.handle
+        st.handle := handle_null ()
+        st.slot := Slot (handle_null ())
+        close_handle_waking h (k_closed ()) 0
+
+/// Same as `signal_close`: the handle owns everything underneath.
+signal_free (s: Signal): Unit = signal_close s
+
+/// Keep watching without keeping the loop alive. What a shutdown watcher wants: it must not
+/// itself be the reason the program has something left to wait for.
+signal_unref (s: Signal): Unit =
+    h = (sg_of s).handle
+    if not (handle_is_null h) then handle_unref h
+
+/// Count this watch again, undoing `signal_unref`.
+signal_ref (s: Signal): Unit =
+    h = (sg_of s).handle
+    if not (handle_is_null h) then handle_ref h
+
+signal_has_ref (s: Signal): Bool =
+    h = (sg_of s).handle
+    not (handle_is_null h) and handle_has_ref h
+
+// --- the numbers ------------------------------------------------------------------------------
+// Read from the platform rather than hardcoded, and re-exported here so a program that watches
+// signals needs this module and nothing below it.
+
+sig_int (): I32 = sigint ()
+sig_term (): I32 = sigterm ()
+sig_usr1 (): I32 = sigusr1 ()
+sig_usr2 (): I32 = sigusr2 ()

@@ -1,0 +1,90 @@
+// What the machine is, and what this program is attached to.
+//
+//     ./examples/run.sh sysinfo
+//     ./examples/run.sh sysinfo | cat        # and watch the last line change
+//
+// Everything here is immediate: no loop, no task, no `Async` effect, no `main` of one line.
+// That is the point of `Uv/Os.an` -- a program that has this binding should not need a second
+// one to find out its own hostname -- and this example is the only one that needs no runtime at
+// all.
+//
+// The last section is the one worth stealing. `is_tty` on descriptor 1 is how a program decides
+// whether anyone is watching: a terminal gets colour, progress and cleared lines, and a pipe
+// gets none of them, because the thing on the other end is a program that has to parse it.
+
+import Local.Uv.Uv.UvError, uv_error_text
+import Local.Uv.Os.hostname, sysname, release, machine, uptime_seconds,
+    cpu_count, cpu_model, cpu_speed_mhz, load_average,
+    total_memory, free_memory, constrained_memory,
+    cwd, exepath, homedir, tmpdir, env_or,
+    handle_kind, kind_tty, kind_pipe, kind_file, is_tty,
+    NetInterface, interfaces, random_bytes
+import Std.Vec.Vec, len
+
+// A number as decimal text. `String` on its own is the type's constructor, so the cast has to
+// be spelled out.
+num (v: I64): String = cast (I32 v)
+
+mb (bytes: I64): String = num (bytes / 1048576) ++ " MB"
+
+// The load averages arrive in thousandths, because nothing here carries a float across the FFI
+// boundary. 1500 is a load of 1.5.
+load (which: I32): String =
+    milli = load_average which
+    num (milli / 1000) ++ "." ++ num ((milli % 1000) / 100)
+
+// Whole seconds into something a person reads.
+duration (secs: I64): String =
+    if secs < 60 then num secs ++ "s"
+    else if secs < 3600 then num (secs / 60) ++ "m"
+    else if secs < 86400 then num (secs / 3600) ++ "h " ++ num ((secs % 3600) / 60) ++ "m"
+    else num (secs / 86400) ++ "d " ++ num ((secs % 86400) / 3600) ++ "h"
+
+kind_name (fd: I32): String =
+    k = handle_kind fd
+    if k == kind_tty () then "a terminal"
+    else if k == kind_pipe () then "a pipe"
+    else if k == kind_file () then "a file"
+    else "something else"
+
+main () =
+    println ("host:      " ++ hostname ())
+    println ("system:    " ++ sysname () ++ " " ++ release () ++ " on " ++ machine ())
+    println ("up:        " ++ duration (uptime_seconds ()))
+    println ("load:      " ++ load 0 ++ " " ++ load 1 ++ " " ++ load 2)
+
+    println ("cpus:      " ++ num (I64 (cpu_count ())) ++ " x " ++ cpu_model 0
+                           ++ " @ " ++ num (cpu_speed_mhz 0) ++ " MHz")
+    println ("memory:    " ++ mb (free_memory ()) ++ " free of " ++ mb (total_memory ()))
+    // Nonzero only inside a cgroup that sets one, which is where the machine's total stops
+    // being the number that matters.
+    limit = constrained_memory ()
+    if limit > 0 then println ("limit:     " ++ mb limit)
+
+    println ""
+    println ("cwd:       " ++ cwd ())
+    println ("exe:       " ++ exepath ())
+    println ("home:      " ++ homedir ())
+    println ("tmp:       " ++ tmpdir ())
+    println ("shell:     " ++ env_or "SHELL" "(unset)")
+
+    println ""
+    println "interfaces:"
+    ifs = interfaces ()
+    var i = 0usz
+    while i < ifs.len do
+        e = ptr_to_mut (offset ifs.data i)
+        println ("  " ++ (if e.internal then "internal  " else "external  ")
+                      ++ clone e.name ++ "  " ++ clone e.address)
+        i := i + 1usz
+
+    println ""
+    match random_bytes 8usz
+    | Ok bytes -> println ("random:    " ++ num (I64 (Usz bytes.length)) ++ " bytes from the platform")
+    | Error e -> println ("random:    " ++ uv_error_text (ref e))
+
+    println ""
+    println ("stdin is   " ++ kind_name 0)
+    println ("stdout is  " ++ kind_name 1)
+    println (if is_tty 1 then "so: colour and progress bars are worth it"
+             else "so: plain output, because something is parsing this")

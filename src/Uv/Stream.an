@@ -1,4 +1,7 @@
-// Byte streams over the Async effect: TCP endpoints and adopted descriptors.
+// Byte streams over the Async effect: TCP endpoints, unix-domain sockets and adopted
+// descriptors. All three are the same Stream once they exist -- only the three ways IN
+// (`connect`, `connect_path`, `stream_adopt_fd`, plus `accept` on either kind of listener)
+// know the difference.
 //
 // Backpressure is parking. A stream reads only while a reader is parked on it; the shim
 // stops reading the moment a chunk arrives with nobody waiting, so a slow reader propagates
@@ -21,21 +24,34 @@ import Local.Uv.Uv.Loop, copy_loop, Slot, copy_slot, slot_new,
     Completion, copy_completion,
     k_eof, k_cancelled, k_closed,
     UvError, uv_check, uv_error_of,
-    handle_null, handle_is_null, handle_adopt_slot, close_handle, close_handle_waking,
+    handle_null, handle_is_null, handle_adopt_slot, handle_ref, handle_unref, handle_has_ref,
+    close_handle, close_handle_waking,
     tcp_new, tcp_bind, tcp_port, listen_handle, accept_handle,
-    pipe_new, pipe_open, stream_readable, stream_writable, stream_write_queue,
-    stream_fileno, buf_string, buf_free, cstr_of_string, as_usz, as_i64
+    tcp_addr, tcp_peer_addr, tcp_peer_port, tcp_nodelay, tcp_keepalive,
+    pipe_new, pipe_open, pipe_bind, pipe_path, pipe_peer_path, pipe_chmod, pipe_peer_cred,
+    pipe_readable, pipe_writable,
+    stream_readable, stream_writable,
+    stream_write_queue, stream_fileno, buf_string, buf_free, buf_alloc, i32_at, i32_set,
+    cstr_of_string, as_usz, as_i64
 import Local.Uv.Task.Runtime, rt_loop
 import Local.Uv.Async.Async, submit, Submission, copy_submission, sub_op2, sub_op3,
-    op_read, op_write, op_connect, op_accept, op_shutdown
+    op_read, op_write, op_connect, op_pipe_connect, op_accept, op_shutdown
 import Std.C.malloc, free
 
 export
     Stream, copy_stream, stream_null, stream_is_null, stream_handle, stream_slot,
     stream_adopt_fd, stream_of_handle, stream_free, stream_close, stream_at_eof, stream_fd,
     stream_can_read, stream_can_write, stream_pending_writes,
-    Listener, copy_listener, listener_bind, listener_free, listener_close, listener_port,
-    accept, connect,
+    stream_ref, stream_unref, stream_has_ref,
+    stream_local_addr, stream_peer_addr, stream_local_port, stream_peer_port,
+    stream_local_path, stream_peer_path, stream_peer_cred,
+    stream_nodelay, stream_keepalive,
+    PeerCred, copy_peercred, pc_pid, pc_uid, pc_gid,
+    socket_readable, socket_writable,
+    Listener, copy_listener, listener_bind, listener_bind_path, listener_free, listener_close,
+    listener_port, listener_is_path, listener_path, listener_addr, listener_chmod,
+    listener_ref, listener_unref, listener_has_ref,
+    accept, connect, connect_path,
     AsyncRead, aread, stream_async_read, AsyncWrite, awrite, stream_async_write,
     ashutdown, read_all, write_all
 
@@ -43,6 +59,19 @@ export
 e_nomem (): I32 = -12
 e_badf (): I32 = -9
 e_cancelled (): I32 = -125
+e_einval (): I32 = -22
+
+/// Who is at the other end of a unix-domain socket. Three ids the kernel vouches for.
+type PeerCred =
+    pid: I32
+    uid: I32
+    gid: I32
+
+impl copy_peercred: Copy PeerCred with (.*) = deref
+
+pc_pid (c: PeerCred): I32 = c.pid
+pc_uid (c: PeerCred): I32 = c.uid
+pc_gid (c: PeerCred): I32 = c.gid
 
 // --- a stream ------------------------------------------------------------------------------------
 
@@ -114,6 +143,85 @@ stream_pending_writes (s: Stream): I64 =
     h = (st_of s).handle
     if handle_is_null h then 0 else stream_write_queue h
 
+// --- what a stream is connected to, and how ------------------------------------------------------
+
+/// The two ends as text, and the remote port. Empty and -1 where there is no such thing: a
+/// unix-domain socket has no port, an adopted descriptor has neither.
+stream_local_addr (s: Stream): String =
+    h = (st_of s).handle
+    if handle_is_null h then "" else tcp_addr h
+
+stream_peer_addr (s: Stream): String =
+    h = (st_of s).handle
+    if handle_is_null h then "" else tcp_peer_addr h
+
+stream_local_port (s: Stream): I32 =
+    h = (st_of s).handle
+    if handle_is_null h then -1 else tcp_port h
+
+stream_peer_port (s: Stream): I32 =
+    h = (st_of s).handle
+    if handle_is_null h then -1 else tcp_peer_port h
+
+/// The path at each end of a unix-domain socket, "" for a TCP one.
+stream_local_path (s: Stream): String =
+    h = (st_of s).handle
+    if handle_is_null h then "" else pipe_path h
+
+stream_peer_path (s: Stream): String =
+    h = (st_of s).handle
+    if handle_is_null h then "" else pipe_peer_path h
+
+/// Who is at the other end of a unix-domain socket, as the kernel knows them: the one
+/// authentication a local socket can do without a protocol of its own. An `Error` means either
+/// that this is not a local socket or that the platform will not say (ENOSYS off Linux).
+stream_peer_cred (s: Stream): Result PeerCred UvError =
+    h = (st_of s).handle
+    if handle_is_null h then Error (uv_error_of (e_badf ()))
+    else
+        // Three I32 out of the shim. Filled in first, so the reads below are defined whatever
+        // the call did, and the buffer is released before either arm is built.
+        cell = buf_alloc 12usz
+        i32_set cell 0usz -1
+        i32_set cell 1usz -1
+        i32_set cell 2usz -1
+        r = pipe_peer_cred h cell
+        pid = i32_at cell 0usz
+        uid = i32_at cell 1usz
+        gid = i32_at cell 2usz
+        buf_free cell
+        if r != 0 then Error (uv_error_of r) else Ok (PeerCred pid uid gid)
+
+/// Send a small write now rather than waiting to coalesce it with the next one. What an
+/// interactive protocol wants -- a request nobody has asked for yet is not worth 40 ms.
+stream_nodelay (s: Stream) (on: Bool): Result Unit UvError =
+    h = (st_of s).handle
+    if handle_is_null h then Error (uv_error_of (e_badf ()))
+    else uv_check (I64 (tcp_nodelay h on))
+
+/// Probe an idle connection after `delay_s` seconds of silence. The only way to notice a peer
+/// that went away without saying so, short of writing to it and failing.
+stream_keepalive (s: Stream) (on: Bool) (delay_s: I32): Result Unit UvError =
+    h = (st_of s).handle
+    if handle_is_null h then Error (uv_error_of (e_badf ()))
+    else uv_check (I64 (tcp_keepalive h on delay_s))
+
+/// Stop this stream from keeping the loop alive. It is read and written exactly as before; it
+/// simply stops being a reason for `run` to keep going. A connection a program serves but does
+/// not want to outlive its real work -- a status socket, a log tail -- is unreferenced here.
+stream_unref (s: Stream): Unit =
+    h = (st_of s).handle
+    if not (handle_is_null h) then handle_unref h
+
+/// Count this stream again, undoing `stream_unref`.
+stream_ref (s: Stream): Unit =
+    h = (st_of s).handle
+    if not (handle_is_null h) then handle_ref h
+
+stream_has_ref (s: Stream): Bool =
+    h = (st_of s).handle
+    not (handle_is_null h) and handle_has_ref h
+
 /// Close the stream, waking any parked reader with end-of-file first. Idempotent, and every
 /// copy of the wrapper sees it. The handle memory and the slot are released by libuv's close
 /// callback on a later loop turn.
@@ -132,9 +240,14 @@ stream_free (s: Stream): Unit = stream_close s
 // --- a listener ------------------------------------------------------------------------------------
 
 // Behind a cell for the same reason a stream is.
+//
+// `is_path` is the one thing a listener has to remember about how it was made: a connection
+// arriving on a unix-domain socket must be accepted INTO a pipe handle and one arriving on a
+// TCP socket into a tcp handle, and by then the call that knew is long gone.
 type ListenerState =
     handle: Ptr U8
     slot: Slot
+    is_path: Bool
 
 type Listener = cell: Ptr ListenerState
 
@@ -142,12 +255,14 @@ impl copy_listener: Copy Listener with (.*) = deref
 
 ls_of (l: Listener): mut ListenerState = ptr_to_mut l.cell
 
-new_listener (h: Ptr U8) (sl: Slot): Listener =
+new_listener (h: Ptr U8) (sl: Slot) (is_path: Bool): Listener =
     p: Ptr ListenerState = malloc (size_of (MkType : Type ListenerState))
-    ptr_store p (ListenerState h sl)
+    ptr_store p (ListenerState h sl is_path)
     Listener p
 
-/// Bind and listen. Port 0 asks the kernel to choose one; `listener_port` reports it.
+/// Bind and listen on a numeric address, IPv4 or IPv6 ("127.0.0.1", "0.0.0.0", "::1", "::").
+/// The address decides the family. Port 0 asks the kernel to choose one; `listener_port`
+/// reports it.
 listener_bind (rtp: Ptr Runtime) (ip: ref String) (port: I32) (backlog: I32): Result Listener UvError =
     h = tcp_new (rt_loop rtp)
     if handle_is_null h then Error (uv_error_of (e_nomem ()))
@@ -159,9 +274,72 @@ listener_bind (rtp: Ptr Runtime) (ip: ref String) (port: I32) (backlog: I32): Re
         if r2 != 0 then
             close_handle h
             Error (uv_error_of r2)
-        else Ok (new_listener h sl)
+        else Ok (new_listener h sl false)
 
+/// Bind and listen on a filesystem PATH: a unix-domain socket. That is how anything reaches an
+/// LSP server, a docker socket or one systemd handed out, and everything above this is the
+/// ordinary stream API -- `accept` hands back a Stream that reads and writes like any other.
+///
+/// The path must not exist yet; libuv unlinks it again when the listener is closed, so a clean
+/// shutdown leaves nothing behind. A listener made this way answers -1 to `listener_port`,
+/// which is the honest answer: it has no port.
+listener_bind_path (rtp: Ptr Runtime) (path: ref String) (backlog: I32): Result Listener UvError =
+    h = pipe_new (rt_loop rtp) false
+    if handle_is_null h then Error (uv_error_of (e_nomem ()))
+    else
+        sl = slot_new ()
+        handle_adopt_slot h sl
+        r = pipe_bind h path
+        r2 = if r != 0 then r else listen_handle h backlog
+        if r2 != 0 then
+            close_handle h
+            Error (uv_error_of r2)
+        else Ok (new_listener h sl true)
+
+/// The port a TCP listener is bound to, or -1 for one bound to a path.
 listener_port (l: Listener): I32 = tcp_port (ls_of l).handle
+
+/// Was this listener bound to a filesystem path rather than to an address and port?
+listener_is_path (l: Listener): Bool = (ls_of l).is_path
+
+/// The path a listener is bound to, or "" for a TCP one.
+listener_path (l: Listener): String =
+    st = ls_of l
+    if st.is_path and not (handle_is_null st.handle) then pipe_path st.handle else ""
+
+/// The address a TCP listener is bound to, or "" for a path one.
+listener_addr (l: Listener): String =
+    st = ls_of l
+    if st.is_path or handle_is_null st.handle then "" else tcp_addr st.handle
+
+/// The two bits `listener_chmod` takes, added together as needed.
+socket_readable (): I32 = pipe_readable ()
+socket_writable (): I32 = pipe_writable ()
+
+/// Who may connect to a unix-domain listener. `flags` is `socket_readable` and
+/// `socket_writable` added together. The default is whatever the umask allowed, which for a
+/// socket other users are meant to reach is usually not it.
+listener_chmod (l: Listener) (flags: I32): Result Unit UvError =
+    st = ls_of l
+    if handle_is_null st.handle then Error (uv_error_of (e_badf ()))
+    else if not st.is_path then Error (uv_error_of (e_einval ()))
+    else uv_check (I64 (pipe_chmod st.handle flags))
+
+/// Keep listening without keeping the loop alive: the accepting stops being a reason for `run`
+/// to keep going. A server whose lifetime is somebody else's decision is unreferenced here, and
+/// the task parked in `accept` is cancelled out of it at shutdown.
+listener_unref (l: Listener): Unit =
+    h = (ls_of l).handle
+    if not (handle_is_null h) then handle_unref h
+
+/// Count this listener again, undoing `listener_unref`.
+listener_ref (l: Listener): Unit =
+    h = (ls_of l).handle
+    if not (handle_is_null h) then handle_ref h
+
+listener_has_ref (l: Listener): Bool =
+    h = (ls_of l).handle
+    not (handle_is_null h) and handle_has_ref h
 
 listener_close (l: Listener): Unit =
     st = ls_of l
@@ -186,7 +364,10 @@ accept (rtp: Ptr Runtime) (l: Listener): Result Stream UvError can Async =
     else if c.kind == k_closed () then Error (uv_error_of (e_badf ()))
     else if c.status < 0 then Error (uv_error_of (I32 c.status))
     else
-        client = tcp_new (rt_loop rtp)
+        // Into a handle of the listener's own kind: uv_accept refuses to put a unix-domain
+        // connection into a tcp handle, and there is nothing in the completion that says which
+        // this was.
+        client = if (ls_of l).is_path then pipe_new (rt_loop rtp) false else tcp_new (rt_loop rtp)
         if handle_is_null client then Error (uv_error_of (e_nomem ()))
         else
             r = accept_handle (ls_of l).handle client
@@ -195,7 +376,9 @@ accept (rtp: Ptr Runtime) (l: Listener): Result Stream UvError can Async =
                 Error (uv_error_of r)
             else Ok (stream_of_handle client)
 
-/// Connect to an IPv4 address and return the connected stream.
+/// Connect to a numeric address, IPv4 or IPv6, and return the connected stream. The address is
+/// what decides the family, so an address `resolve` handed back -- either kind -- goes straight
+/// in here.
 connect (rtp: Ptr Runtime) (ip: ref String) (port: I32): Result Stream UvError can Async =
     h = tcp_new (rt_loop rtp)
     if handle_is_null h then Error (uv_error_of (e_nomem ()))
@@ -206,6 +389,27 @@ connect (rtp: Ptr Runtime) (ip: ref String) (port: I32): Result Stream UvError c
         addr = cstr_of_string ip
         c = submit (sub_op3 (op_connect ()) (I64 port) 0 h addr)
         buf_free addr
+        code = if c.kind == k_cancelled () then e_cancelled ()
+               else if c.status < 0 then I32 c.status
+               else 0
+        if code != 0 then
+            stream_free s
+            Error (uv_error_of code)
+        else Ok s
+
+/// Connect to a unix-domain socket by path, and return the connected stream. The other half of
+/// `listener_bind_path`, and what reaches a server that lives on the filesystem rather than on
+/// a port. What comes back is an ordinary Stream.
+connect_path (rtp: Ptr Runtime) (path: ref String): Result Stream UvError can Async =
+    h = pipe_new (rt_loop rtp) false
+    if handle_is_null h then Error (uv_error_of (e_nomem ()))
+    else
+        s = stream_of_handle h
+        // Borrowed for the duration of the call, as the address is in `connect`: the shim
+        // copies the path into the request before this returns.
+        p = cstr_of_string path
+        c = submit (sub_op3 (op_pipe_connect ()) 0 0 h p)
+        buf_free p
         code = if c.kind == k_cancelled () then e_cancelled ()
                else if c.status < 0 then I32 c.status
                else 0

@@ -33,9 +33,10 @@
 
 import Local.Uv.Uv.Loop, loop_new, loop_run_once, loop_run_nowait, loop_alive,
     loop_walk_close_all, loop_close_free, loop_null, loop_is_null, copy_loop,
+    loop_now, loop_update_time, loop_backend_fd, loop_backend_timeout,
     Slot, slot_new, slot_free, slot_park, slot_completion, slot_post, slot_rearm, copy_slot,
     Completion, completion_none, copy_completion, k_cancelled, k_joined, k_timer,
-    handle_null, handle_is_null, handle_set_slot, close_handle,
+    handle_null, handle_is_null, handle_set_slot, handle_unref, close_handle,
     timer_new, timer_start, timer_stop,
     poll_new, poll_start, poll_stop, uv_writable, k_poll
 import Std.Vec.Vec, empty, push, len, clear
@@ -43,11 +44,12 @@ import Std.C.malloc, free
 
 export
     Runtime, rt_new, rt_free, rt_loop, rt_task_count, rt_live_count, rt_is_shutting_down,
+    rt_now, rt_update_time, rt_backend_fd, rt_backend_timeout,
     Task, ts_running, ts_parked, ts_done, ts_reaped,
     spawn, spawn_default, park, park_on, join, cancel, wake, abandon,
     run, step, step_nowait, run_ready, has_ready, shutdown,
     current_id, current_slot, on_own_stack, task_state, task_result, set_result,
-    default_stack_bytes, task_sleep, sleep_ms, task_wait_writable
+    default_stack_bytes, task_sleep, task_sleep_unref, sleep_ms, task_wait_writable
 
 // --- coroutine primitives ----------------------------------------------------------------------
 // `mco_coro_init` hardcodes a 56 KB stack; `pc_coro_init_sized` (src/Runtime/csrc/pc_coro.c) is
@@ -134,6 +136,20 @@ vec_release (v: mut Vec a): Unit =
     v.cap := 0usz
 
 rt_loop (rtp: Ptr Runtime): Loop = (ptr_to_mut rtp).uvloop
+
+/// The loop's clock, in milliseconds: the time the scheduler last looked, not the time now.
+/// Every timer in one turn agrees about it, which is what makes "these two fired together"
+/// mean something. `rt_update_time` is how a long stretch of computation says "look again"
+/// before starting the next round of waits.
+rt_now (rtp: Ptr Runtime): I64 = loop_now (rt_loop rtp)
+rt_update_time (rtp: Ptr Runtime): Unit = loop_update_time (rt_loop rtp)
+
+/// What an embedder needs to drive this runtime from inside ANOTHER loop -- a GUI toolkit's.
+/// Wait for `rt_backend_fd` to become readable, with `rt_backend_timeout` as the deadline (-1
+/// meaning none), then call `step_nowait`. That is the whole protocol; `step` is the version
+/// for a program that owns its own waiting.
+rt_backend_fd (rtp: Ptr Runtime): I32 = loop_backend_fd (rt_loop rtp)
+rt_backend_timeout (rtp: Ptr Runtime): I32 = loop_backend_timeout (rt_loop rtp)
 
 rt_is_shutting_down (rtp: Ptr Runtime): Bool = (ptr_to_mut rtp).shutting_down
 
@@ -511,7 +527,22 @@ shutdown (rtp: Ptr Runtime): Unit =
 
 /// Park the running task on a one-shot timer. The timer is closed on every path, including
 /// cancellation, so no trampoline can ever reach the slot of a task that is already gone.
-task_sleep (rtp: Ptr Runtime) (ms: I64): Completion =
+task_sleep (rtp: Ptr Runtime) (ms: I64): Completion = task_sleep_keeping rtp ms true
+
+/// The same wait, on a timer that does NOT keep the loop alive.
+///
+/// This is the whole of what `handle_unref` buys a task. A heartbeat -- a task that ticks
+/// forever and is nobody's reason to keep going -- is written as an ordinary loop around this,
+/// and `run` still returns once the real work is done, cancelling the sleep on its way out.
+/// Written around `task_sleep` instead, the same loop makes `run` never return at all.
+///
+/// The wait itself is unchanged: the timer fires on time and the completion is a `timer` one.
+/// What changes is only whether the SCHEDULER counts it, which is what `loop_alive` reports.
+task_sleep_unref (rtp: Ptr Runtime) (ms: I64): Completion = task_sleep_keeping rtp ms false
+
+// Both of the above. `keeps_loop_alive` is the one line of difference, and it is applied after
+// the start because unreferencing is a property of the handle rather than of the operation.
+task_sleep_keeping (rtp: Ptr Runtime) (ms: I64) (keeps_loop_alive: Bool): Completion =
     slot = current_slot rtp
     if handle_is_null slot.handle then panic "Uv.Task.task_sleep: not on a task stack"
     h = timer_new (rt_loop rtp)
@@ -520,6 +551,7 @@ task_sleep (rtp: Ptr Runtime) (ms: I64): Completion =
         handle_set_slot h slot
         slot_rearm slot
         ignore (timer_start h ms 0)
+        if not keeps_loop_alive then handle_unref h
         c = park rtp
         ignore (timer_stop h)
         close_handle h

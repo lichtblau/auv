@@ -16,15 +16,17 @@ import Std.C.malloc, free
 export
     Loop, copy_loop, loop_null, loop_is_null, loop_new, loop_run_once, loop_run_nowait, loop_alive,
     loop_walk_close_all, loop_close_free, loop_thread_faults, loop_read_stops,
+    loop_now, loop_update_time, loop_backend_fd, loop_backend_timeout,
     Slot, copy_slot, slot_new, slot_free, slot_state, slot_rearm, slot_park, slot_completion, slot_post,
     slot_deliver, slot_kind, slot_status,
     st_empty, st_parked, st_done, st_delivered,
     Completion, copy_completion, completion_none, comp_is, comp_ok,
     k_none, k_timer, k_poll, k_signal, k_prepare, k_check, k_idle, k_async, k_closed,
     k_cancelled, k_joined, k_connect, k_connection, k_read, k_write, k_shutdown, k_eof,
-    k_fs, k_addrinfo, k_exit, k_user,
+    k_fs, k_addrinfo, k_exit, k_dgram, k_fsevent, k_user,
     UvError, uv_check, uv_error_of, uv_err_name_of, uv_err_msg_of, uv_error_text,
     handle_null, handle_is_null, handle_set_slot, handle_adopt_slot, handle_slot, handle_is_closing,
+    handle_ref, handle_unref, handle_has_ref,
     close_handle, close_handle_waking,
     timer_new, timer_start, timer_stop,
     poll_new, poll_start, poll_stop, uv_readable, uv_writable, uv_disconnect,
@@ -34,13 +36,22 @@ export
     idle_new, idle_start, idle_stop,
     async_new, async_send,
     tcp_new, tcp_bind, tcp_port, tcp_connect, tcp_connect_cstr, listen_handle, accept_handle,
-    pipe_new, pipe_open,
+    tcp_addr, tcp_peer_addr, tcp_peer_port, tcp_nodelay, tcp_keepalive,
+    pipe_new, pipe_open, pipe_bind, pipe_connect_cstr, pipe_path, pipe_peer_path,
+    pipe_chmod, pipe_readable, pipe_writable, pipe_peer_cred,
     read_start, read_stop, stream_write, stream_write_string, stream_shutdown,
     stream_readable, stream_writable, stream_write_queue, stream_fileno,
-    fs_submit, fs_sync, getaddrinfo_start, getaddrinfo_sync,
-    ptr_at, ptr_set, process_spawn, process_kill, process_pid,
-    buf_alloc, buf_free, buf_read, buf_write, buf_string, buf_of_string,
-    cstr_of_string, cstr_string, i32_at, i32_set,
+    udp_new, udp_bind, udp_port, udp_recv_start, udp_recv_stop, udp_send, udp_try_send,
+    udp_connect, udp_addr, udp_peer_addr, udp_peer_port,
+    udp_set_broadcast, udp_set_ttl, udp_set_multicast_loop, udp_set_multicast_ttl, udp_membership,
+    dgram_header, dgram_ip_len, dgram_port,
+    fs_event_new, fs_event_start, fs_event_stop, fs_poll_new, fs_poll_start, fs_poll_stop,
+    fs_event_recursive, fsevent_header, fsevent_renamed, fsevent_changed,
+    fs_submit, fs_sync, getaddrinfo_start, getaddrinfo_sync, getnameinfo_start, getnameinfo_sync,
+    read_cstr_fn, read_cstr_h, read_cstr0,
+    ptr_at, ptr_set, process_spawn, process_spawn_with, process_kill, process_pid,
+    buf_alloc, buf_free, buf_read, buf_write, buf_string, buf_string_at, buf_of_string,
+    cstr_of_string, cstr_string, i32_at, i32_set, ptr_as_i64, i64_as_ptr,
     pipe_fds, socketpair_fds, fd_nonblock, fd_write, fd_write_string, fd_read, fd_close,
     getpid, kill_pid, sigusr1, sigusr2, sigterm, sigint,
     hrtime_ms, uv_sleep_ms, as_i64, as_u64, as_usz
@@ -54,6 +65,10 @@ auv_loop_walk_close_all = extern "auv_loop_walk_close_all": fn (Ptr U8) -> Unit
 auv_loop_close_free     = extern "auv_loop_close_free":     fn (Ptr U8) -> I32
 auv_loop_thread_faults  = extern "auv_loop_thread_faults":  fn (Ptr U8) -> I64
 auv_loop_read_stops     = extern "auv_loop_read_stops":     fn (Ptr U8) -> I64
+auv_loop_now            = extern "auv_loop_now":            fn (Ptr U8) -> I64
+auv_loop_update_time    = extern "auv_loop_update_time":    fn (Ptr U8) -> Unit
+auv_loop_backend_fd     = extern "auv_loop_backend_fd":     fn (Ptr U8) -> I32
+auv_loop_backend_timeout = extern "auv_loop_backend_timeout": fn (Ptr U8) -> I32
 
 auv_slot_new          = extern "auv_slot_new":          fn Unit -> Ptr U8
 auv_slot_free         = extern "auv_slot_free":         fn (Ptr U8) -> Unit
@@ -99,6 +114,9 @@ auv_handle_set_slot  = extern "auv_handle_set_slot":  fn (Ptr U8) (Ptr U8) -> Un
 auv_handle_adopt_slot = extern "auv_handle_adopt_slot": fn (Ptr U8) (Ptr U8) -> Unit
 auv_handle_slot      = extern "auv_handle_slot":      fn (Ptr U8) -> Ptr U8
 auv_handle_is_closing = extern "auv_handle_is_closing": fn (Ptr U8) -> I32
+auv_ref              = extern "auv_ref":              fn (Ptr U8) -> Unit
+auv_unref            = extern "auv_unref":            fn (Ptr U8) -> Unit
+auv_has_ref          = extern "auv_has_ref":          fn (Ptr U8) -> I32
 auv_close            = extern "auv_close":            fn (Ptr U8) -> Unit
 auv_close_waking     = extern "auv_close_waking":     fn (Ptr U8) I32 I64 -> Unit
 
@@ -132,8 +150,24 @@ auv_async_send = extern "auv_async_send": fn (Ptr U8) -> I32
 auv_ptr_at         = extern "auv_ptr_at":         fn (Ptr U8) Usz -> Ptr U8
 auv_ptr_set        = extern "auv_ptr_set":        fn (Ptr U8) Usz (Ptr U8) -> Unit
 auv_process_spawn  = extern "auv_process_spawn":  fn (Ptr U8) (Ptr U8) (Ptr U8) (Ptr U8) (Ptr U8) (Ptr U8) (Ptr U8) (Ptr U8) -> Ptr U8
+auv_process_spawn2 = extern "auv_process_spawn2": fn (Ptr U8) (Ptr U8) (Ptr U8) (Ptr U8) (Ptr U8) (Ptr U8) -> Ptr U8
 auv_process_kill   = extern "auv_process_kill":   fn (Ptr U8) I32 -> I32
 auv_process_pid    = extern "auv_process_pid":    fn (Ptr U8) -> I32
+
+auv_fs_event_new       = extern "auv_fs_event_new":       fn (Ptr U8) -> Ptr U8
+auv_fs_event_start     = extern "auv_fs_event_start":     fn (Ptr U8) (Ptr U8) I32 -> I32
+auv_fs_event_stop      = extern "auv_fs_event_stop":      fn (Ptr U8) -> I32
+auv_fs_poll_new        = extern "auv_fs_poll_new":        fn (Ptr U8) -> Ptr U8
+auv_fs_poll_start      = extern "auv_fs_poll_start":      fn (Ptr U8) (Ptr U8) I32 -> I32
+auv_fs_poll_stop       = extern "auv_fs_poll_stop":       fn (Ptr U8) -> I32
+auv_fs_event_recursive = extern "auv_fs_event_recursive": fn Unit -> I32
+
+auv_udp_new         = extern "auv_udp_new":         fn (Ptr U8) -> Ptr U8
+auv_udp_bind        = extern "auv_udp_bind":        fn (Ptr U8) (Ptr U8) I32 -> I32
+auv_udp_port        = extern "auv_udp_port":        fn (Ptr U8) -> I32
+auv_udp_recv_start  = extern "auv_udp_recv_start":  fn (Ptr U8) -> I32
+auv_udp_recv_stop   = extern "auv_udp_recv_stop":   fn (Ptr U8) -> I32
+auv_udp_send        = extern "auv_udp_send":        fn (Ptr U8) (Ptr U8) Usz (Ptr U8) I32 (Ptr U8) -> I32
 
 auv_fs_submit        = extern "auv_fs_submit":        fn (Ptr U8) I32 I64 I64 I64 (Ptr U8) (Ptr U8) (Ptr U8) -> I32
 auv_fs_sync          = extern "auv_fs_sync":          fn I32 I64 I64 I64 (Ptr U8) (Ptr U8) (Ptr U8) -> I32
@@ -144,10 +178,37 @@ auv_tcp_new         = extern "auv_tcp_new":         fn (Ptr U8) -> Ptr U8
 auv_tcp_bind        = extern "auv_tcp_bind":        fn (Ptr U8) (Ptr U8) I32 -> I32
 auv_tcp_port        = extern "auv_tcp_port":        fn (Ptr U8) -> I32
 auv_tcp_connect     = extern "auv_tcp_connect":     fn (Ptr U8) (Ptr U8) I32 (Ptr U8) -> I32
+auv_tcp_addr        = extern "auv_tcp_addr":        fn (Ptr U8) (Ptr U8) Usz -> Usz
+auv_tcp_peer_addr   = extern "auv_tcp_peer_addr":   fn (Ptr U8) (Ptr U8) Usz -> Usz
+auv_tcp_peer_port   = extern "auv_tcp_peer_port":   fn (Ptr U8) -> I32
+auv_tcp_nodelay     = extern "auv_tcp_nodelay":     fn (Ptr U8) I32 -> I32
+auv_tcp_keepalive   = extern "auv_tcp_keepalive":   fn (Ptr U8) I32 I32 -> I32
 auv_listen          = extern "auv_listen":          fn (Ptr U8) I32 -> I32
 auv_accept          = extern "auv_accept":          fn (Ptr U8) (Ptr U8) -> I32
 auv_pipe_new        = extern "auv_pipe_new":        fn (Ptr U8) I32 -> Ptr U8
 auv_pipe_open       = extern "auv_pipe_open":       fn (Ptr U8) I32 -> I32
+auv_pipe_bind       = extern "auv_pipe_bind":       fn (Ptr U8) (Ptr U8) -> I32
+auv_pipe_connect    = extern "auv_pipe_connect":    fn (Ptr U8) (Ptr U8) (Ptr U8) -> I32
+auv_pipe_path       = extern "auv_pipe_path":       fn (Ptr U8) (Ptr U8) Usz -> Usz
+auv_pipe_peer_path  = extern "auv_pipe_peer_path":  fn (Ptr U8) (Ptr U8) Usz -> Usz
+auv_pipe_chmod      = extern "auv_pipe_chmod":      fn (Ptr U8) I32 -> I32
+auv_pipe_readable_flag = extern "auv_pipe_readable_flag": fn Unit -> I32
+auv_pipe_writable_flag = extern "auv_pipe_writable_flag": fn Unit -> I32
+auv_pipe_peer_cred  = extern "auv_pipe_peer_cred":  fn (Ptr U8) (Ptr U8) -> I32
+
+auv_udp_try_send    = extern "auv_udp_try_send":    fn (Ptr U8) (Ptr U8) Usz (Ptr U8) I32 -> I64
+auv_udp_connect     = extern "auv_udp_connect":     fn (Ptr U8) (Ptr U8) I32 -> I32
+auv_udp_addr        = extern "auv_udp_addr":        fn (Ptr U8) (Ptr U8) Usz -> Usz
+auv_udp_peer_addr   = extern "auv_udp_peer_addr":   fn (Ptr U8) (Ptr U8) Usz -> Usz
+auv_udp_peer_port   = extern "auv_udp_peer_port":   fn (Ptr U8) -> I32
+auv_udp_set_broadcast      = extern "auv_udp_set_broadcast":      fn (Ptr U8) I32 -> I32
+auv_udp_set_ttl            = extern "auv_udp_set_ttl":            fn (Ptr U8) I32 -> I32
+auv_udp_set_multicast_loop = extern "auv_udp_set_multicast_loop": fn (Ptr U8) I32 -> I32
+auv_udp_set_multicast_ttl  = extern "auv_udp_set_multicast_ttl":  fn (Ptr U8) I32 -> I32
+auv_udp_membership         = extern "auv_udp_membership":         fn (Ptr U8) (Ptr U8) (Ptr U8) I32 -> I32
+
+auv_getnameinfo      = extern "auv_getnameinfo":      fn (Ptr U8) (Ptr U8) I32 (Ptr U8) -> I32
+auv_getnameinfo_sync = extern "auv_getnameinfo_sync": fn (Ptr U8) I32 (Ptr U8) -> I32
 auv_read_start      = extern "auv_read_start":      fn (Ptr U8) -> I32
 auv_read_stop       = extern "auv_read_stop":       fn (Ptr U8) -> I32
 auv_stream_write    = extern "auv_stream_write":    fn (Ptr U8) (Ptr U8) Usz (Ptr U8) -> I32
@@ -201,6 +262,18 @@ loop_thread_faults (l: Loop): I64 = auv_loop_thread_faults l.handle
 
 /// How many times a stream was told to stop reading, i.e. how often backpressure engaged.
 loop_read_stops (l: Loop): I64 = auv_loop_read_stops l.handle
+
+/// The loop's own clock, in milliseconds. Read once per turn and cached, which is what makes
+/// every timer in one turn agree about what time it is -- so a long callback sees a clock that
+/// has not moved. `loop_update_time` is how code that cares says "look again".
+loop_now (l: Loop): I64 = auv_loop_now l.handle
+loop_update_time (l: Loop): Unit = auv_loop_update_time l.handle
+
+/// What you would need to drive this loop from inside ANOTHER one -- a GUI toolkit's, say.
+/// Poll the backend descriptor for readability with the backend timeout as the deadline, and
+/// when either fires run one non-blocking turn. A timeout of -1 means "no deadline".
+loop_backend_fd (l: Loop): I32 = auv_loop_backend_fd l.handle
+loop_backend_timeout (l: Loop): I32 = auv_loop_backend_timeout l.handle
 
 // --- wait slots --------------------------------------------------------------------------------
 type Slot = handle: Ptr U8
@@ -279,6 +352,8 @@ k_eof (): I32 = 16
 k_fs (): I32 = 17
 k_addrinfo (): I32 = 18
 k_exit (): I32 = 19
+k_dgram (): I32 = 20
+k_fsevent (): I32 = 21
 
 /// The first completion kind an EMBEDDER may define, and the guarantee that goes with it: the
 /// numbers below belong to this binding and will keep growing as it binds more of libuv, so an
@@ -308,6 +383,11 @@ k_user (): I32 = 100
 type UvError =
     code: I32
 
+// Every string getter in the shim takes the same shape -- a first call with a null buffer
+// reports the length, a second one fills it -- so the dance is written once per shape of
+// getter rather than once per getter. `read_cstr_h` covers everything that asks ABOUT
+// something (a handle, a name); `read_cstr0` everything that asks about the machine.
+
 /// Read one of the shim's string getters into a fresh String (size, then fill).
 read_cstr_fn (f: fn I32 (Ptr U8) Usz -> Usz) (code: I32): String =
     n = f code (handle_null ()) 0usz
@@ -315,6 +395,24 @@ read_cstr_fn (f: fn I32 (Ptr U8) Usz -> Usz) (code: I32): String =
     else
         buf: Ptr Char = malloc n
         ignore (f code (transmute buf) n)
+        String.from_parts buf (U32 n)
+
+/// The same, for a getter that takes a pointer -- a handle, or a NUL-terminated name.
+read_cstr_h (f: fn (Ptr U8) (Ptr U8) Usz -> Usz) (h: Ptr U8): String =
+    n = f h (handle_null ()) 0usz
+    if n == 0usz then ""
+    else
+        buf: Ptr Char = malloc n
+        ignore (f h (transmute buf) n)
+        String.from_parts buf (U32 n)
+
+/// The same, for a getter that takes nothing at all.
+read_cstr0 (f: fn (Ptr U8) Usz -> Usz): String =
+    n = f (handle_null ()) 0usz
+    if n == 0usz then ""
+    else
+        buf: Ptr Char = malloc n
+        ignore (f (transmute buf) n)
         String.from_parts buf (U32 n)
 
 uv_err_name_of (code: I32): String = read_cstr_fn auv_err_name code
@@ -343,6 +441,22 @@ handle_set_slot (h: Ptr U8) (s: Slot): Unit = auv_handle_set_slot h s.handle
 handle_adopt_slot (h: Ptr U8) (s: Slot): Unit = auv_handle_adopt_slot h s.handle
 handle_slot (h: Ptr U8): Slot = Slot (auv_handle_slot h)
 handle_is_closing (h: Ptr U8): Bool = auv_handle_is_closing h != 0
+
+/// Count this handle again as a reason to keep the loop running. The default for every handle,
+/// and what undoes `handle_unref`.
+handle_ref (h: Ptr U8): Unit = auv_ref h
+
+/// Watch WITHOUT keeping the loop alive. The handle still fires exactly as before; it just
+/// stops being a reason for `run` to keep going, so a program can hold a heartbeat timer or a
+/// SIGINT watch and still finish when its real work is done. Without this, parking on a
+/// background watcher means `run` never returns.
+///
+/// Independent of active/inactive and of whether a task is parked on it: unreferencing decides
+/// only whether the handle is COUNTED, and the count is what `loop_alive` reports.
+handle_unref (h: Ptr U8): Unit = auv_unref h
+
+/// Does this handle count toward keeping the loop alive?
+handle_has_ref (h: Ptr U8): Bool = auv_has_ref h != 0
 
 /// Start closing a handle. libuv frees the handle memory from the close callback, so the
 /// loop has to run at least once more before the memory is actually gone; the Ante-side
@@ -396,7 +510,9 @@ async_send (h: Ptr U8): I32 = auv_async_send h
 
 tcp_new (l: Loop): Ptr U8 = auv_tcp_new l.handle
 
-/// Bind to an IPv4 address. Port 0 asks the kernel to choose; `tcp_port` reports which.
+/// Bind to a numeric address, IPv4 or IPv6 -- the shim tries each parser in turn, so "0.0.0.0"
+/// and "::" are both accepted and the address decides the socket's family. Port 0 asks the
+/// kernel to choose one; `tcp_port` reports which, for either family.
 tcp_bind (h: Ptr U8) (ip: ref String) (port: I32): I32 =
     p = cstr_of_string ip
     r = auv_tcp_bind h p port
@@ -405,7 +521,23 @@ tcp_bind (h: Ptr U8) (ip: ref String) (port: I32): I32 =
 
 tcp_port (h: Ptr U8): I32 = auv_tcp_port h
 
-/// Start connecting. The result arrives as a `connect` completion in `waiter`.
+/// The local and remote ends as text, either family, and the remote port. Empty and -1 for a
+/// socket that has no such end: a listener has no peer, and a unix-domain socket has no port.
+tcp_addr (h: Ptr U8): String = read_cstr_h auv_tcp_addr h
+tcp_peer_addr (h: Ptr U8): String = read_cstr_h auv_tcp_peer_addr h
+tcp_peer_port (h: Ptr U8): I32 = auv_tcp_peer_port h
+
+/// Nagle off: send a small write now rather than waiting to coalesce it with the next one.
+/// What an interactive protocol wants and a bulk transfer does not.
+tcp_nodelay (h: Ptr U8) (on: Bool): I32 = auv_tcp_nodelay h (if on then 1 else 0)
+
+/// Probe an idle connection after `delay_s` seconds of silence. The only way to notice a peer
+/// that went away without saying so, short of writing to it and failing.
+tcp_keepalive (h: Ptr U8) (on: Bool) (delay_s: I32): I32 =
+    auv_tcp_keepalive h (if on then 1 else 0) delay_s
+
+/// Start connecting to a numeric address, IPv4 or IPv6. The result arrives as a `connect`
+/// completion in `waiter`.
 ///
 /// Request-based operations (connect, write, shutdown) take the waiter's slot explicitly
 /// rather than using the handle's. A stream's own slot belongs to its reads, and reading
@@ -432,6 +564,38 @@ pipe_new (l: Loop) (ipc: Bool): Ptr U8 = auv_pipe_new l.handle (if ipc then 1 el
 
 /// Adopt an existing descriptor: a socketpair end, a pty master, a child's stdio.
 pipe_open (h: Ptr U8) (fd: I32): I32 = auv_pipe_open h fd
+
+/// Bind to a filesystem PATH: a unix-domain socket, which `listen_handle` then listens on
+/// exactly as it does a TCP one. libuv unlinks the path again when the handle is closed.
+pipe_bind (h: Ptr U8) (path: ref String): I32 =
+    p = cstr_of_string path
+    r = auv_pipe_bind h p
+    auv_buf_free p
+    r
+
+/// Start connecting to a unix-domain socket by path. The result arrives as a `connect`
+/// completion in `waiter`, and ALWAYS arrives there: unlike the TCP call, this one has no
+/// synchronous failure to report, so a 0 here means the request is in flight and nothing more.
+pipe_connect_cstr (h: Ptr U8) (path: Ptr U8) (waiter: Slot): I32 =
+    auv_pipe_connect h path waiter.handle
+
+/// The path this pipe is bound or connected to, or "" for one that is neither (an adopted
+/// descriptor, say), and the path at the other end.
+pipe_path (h: Ptr U8): String = read_cstr_h auv_pipe_path h
+pipe_peer_path (h: Ptr U8): String = read_cstr_h auv_pipe_peer_path h
+
+/// Who may connect to a unix-domain socket. `flags` is `pipe_readable` and `pipe_writable`
+/// added together; the default is whatever the process umask allowed, which for a service other
+/// users are meant to reach is usually not what was wanted.
+pipe_chmod (h: Ptr U8) (flags: I32): I32 = auv_pipe_chmod h flags
+pipe_readable (): I32 = auv_pipe_readable_flag ()
+pipe_writable (): I32 = auv_pipe_writable_flag ()
+
+/// The pid, uid and gid of whoever is at the other end of a unix-domain socket, into `out`
+/// (three I32, read with `i32_at`). As the KERNEL knows them rather than as the peer claims --
+/// the one authentication a local socket can do without a protocol of its own. ENOSYS off
+/// Linux, where the socket option this needs is spelled differently and is not implemented.
+pipe_peer_cred (h: Ptr U8) (out: Ptr U8): I32 = auv_pipe_peer_cred h out
 
 /// Begin reading. Idempotent, because the reader parks again from inside the callback that
 /// delivered the previous chunk.
@@ -460,6 +624,126 @@ stream_write_queue (h: Ptr U8): I64 = auv_stream_write_queue h
 
 stream_fileno (h: Ptr U8): I32 = auv_stream_fileno h
 
+// --- udp ---------------------------------------------------------------------------------------
+// A datagram socket carries its own wait slot, like a stream, and every arrival lands there.
+// The payload a `dgram` completion carries is one buffer holding the SENDER and the bytes:
+//
+//     i32 ip_len | i32 port | <ip_len bytes of address text> | <the datagram>
+//
+// with the datagram's own length in the completion's `aux`. `dgram_header` is where the address
+// starts and `dgram_ip_len`/`dgram_port` read the first two fields, so nothing above this line
+// does pointer arithmetic.
+
+udp_new (l: Loop): Ptr U8 = auv_udp_new l.handle
+
+/// Bind to a numeric address, IPv4 or IPv6. Port 0 asks the kernel to choose one.
+udp_bind (h: Ptr U8) (ip: ref String) (port: I32): I32 =
+    p = cstr_of_string ip
+    r = auv_udp_bind h p port
+    auv_buf_free p
+    r
+
+udp_port (h: Ptr U8): I32 = auv_udp_port h
+
+/// Begin receiving. Idempotent, because the reader re-arms from inside the callback that
+/// delivered the previous datagram.
+udp_recv_start (h: Ptr U8): I32 = auv_udp_recv_start h
+
+/// Stop receiving. The shim does this on its own whenever a datagram arrives with no reader
+/// parked, which leaves the next one in the kernel's buffer rather than dropping it here.
+udp_recv_stop (h: Ptr U8): I32 = auv_udp_recv_stop h
+
+/// Queue a datagram. The bytes are copied into the request; the completion lands in `waiter`.
+/// A null or empty `ip` means "wherever this socket is connected", which is the only thing a
+/// connected socket accepts.
+udp_send (h: Ptr U8) (bytes: Ptr U8) (n: Usz) (ip: Ptr U8) (port: I32) (waiter: Slot): I32 =
+    auv_udp_send h bytes n ip port waiter.handle
+
+/// Send now or not at all: no request, no wait slot, and UV_EAGAIN rather than a queue when
+/// the kernel will not take it. Returns the number of bytes sent, or a negative uv code.
+udp_try_send (h: Ptr U8) (bytes: Ptr U8) (n: Usz) (ip: Ptr U8) (port: I32): I64 =
+    auv_udp_try_send h bytes n ip port
+
+/// Fix a peer: sends need no address after this and datagrams from anyone else are dropped by
+/// the kernel. An empty address disconnects again.
+udp_connect (h: Ptr U8) (ip: ref String) (port: I32): I32 =
+    p = cstr_of_string ip
+    r = auv_udp_connect h p port
+    auv_buf_free p
+    r
+
+udp_addr (h: Ptr U8): String = read_cstr_h auv_udp_addr h
+udp_peer_addr (h: Ptr U8): String = read_cstr_h auv_udp_peer_addr h
+udp_peer_port (h: Ptr U8): I32 = auv_udp_peer_port h
+
+/// The knobs on a datagram socket. Broadcast has to be asked for before the kernel will send to
+/// a broadcast address; the TTL bounds how far a datagram travels; the multicast pair decides
+/// whether a group send comes back to this host and how far it goes.
+udp_set_broadcast (h: Ptr U8) (on: Bool): I32 = auv_udp_set_broadcast h (if on then 1 else 0)
+udp_set_ttl (h: Ptr U8) (ttl: I32): I32 = auv_udp_set_ttl h ttl
+udp_set_multicast_loop (h: Ptr U8) (on: Bool): I32 =
+    auv_udp_set_multicast_loop h (if on then 1 else 0)
+udp_set_multicast_ttl (h: Ptr U8) (ttl: I32): I32 = auv_udp_set_multicast_ttl h ttl
+
+/// Join or leave a multicast group. An empty `iface` means "whichever interface the routing
+/// table picks", which is what a machine with one network wants.
+udp_membership (h: Ptr U8) (group: ref String) (iface: ref String) (join: Bool): I32 =
+    g = cstr_of_string group
+    i = cstr_of_string iface
+    r = auv_udp_membership h g i (if join then 1 else 0)
+    auv_buf_free g
+    auv_buf_free i
+    r
+
+/// Where a datagram payload's address text starts, and its two header fields.
+dgram_header (): Usz = 8usz
+dgram_ip_len (payload: Ptr U8): Usz = as_usz (I64 (auv_i32_at payload 0usz))
+dgram_port (payload: Ptr U8): I32 = auv_i32_at payload 1usz
+
+// --- file watching -------------------------------------------------------------------------------
+// Two handles for one job. `fs_event` is the kernel telling you and does not work everywhere;
+// `fs_poll` is a stat on a timer and does. Both deliver an `fsevent` completion into the
+// handle's own slot; what the payload holds is what differs.
+//
+// An fs_event payload carries the change:
+//
+//     i32 renamed | i32 changed | <the name>
+//
+// with the name's length in `aux`. The mask is split into two flags by the shim because there
+// are no bitwise operators to take one apart with here. An fs_poll payload is the file's
+// current stat, packed exactly as `fs_stat`'s is and read with the same accessor.
+
+fs_event_new (l: Loop): Ptr U8 = auv_fs_event_new l.handle
+
+/// Start watching a path. `flags` is 0, or `fs_event_recursive` where the platform has it.
+fs_event_start (h: Ptr U8) (path: ref String) (flags: I32): I32 =
+    p = cstr_of_string path
+    r = auv_fs_event_start h p flags
+    auv_buf_free p
+    r
+
+fs_event_stop (h: Ptr U8): I32 = auv_fs_event_stop h
+
+fs_poll_new (l: Loop): Ptr U8 = auv_fs_poll_new l.handle
+
+/// Stat `path` every `interval_ms` and report every change.
+fs_poll_start (h: Ptr U8) (path: ref String) (interval_ms: I32): I32 =
+    p = cstr_of_string path
+    r = auv_fs_poll_start h p interval_ms
+    auv_buf_free p
+    r
+
+fs_poll_stop (h: Ptr U8): I32 = auv_fs_poll_stop h
+
+fs_event_recursive (): I32 = auv_fs_event_recursive ()
+
+/// Where an fs_event payload's name starts, and the two flags in front of it: a name appeared
+/// or went away, and contents changed. Either, both, or (on a platform that will not say)
+/// neither.
+fsevent_header (): Usz = 8usz
+fsevent_renamed (payload: Ptr U8): Bool = auv_i32_at payload 0usz != 0
+fsevent_changed (payload: Ptr U8): Bool = auv_i32_at payload 1usz != 0
+
 // --- filesystem and name resolution ------------------------------------------------------------------
 // One entry point each rather than one per call: the C backend synthesizes a prototype per
 // extern site, and a single wide signature is a single thing to keep right. `sub` picks the
@@ -481,6 +765,14 @@ getaddrinfo_start (l: Loop) (host: Ptr U8) (service: Ptr U8) (waiter: Slot): I32
 getaddrinfo_sync (host: Ptr U8) (service: Ptr U8) (waiter: Slot): I32 =
     auv_getaddrinfo_sync host service waiter.handle
 
+/// Start resolving an address BACK to a name. The completion carries two newline-separated
+/// lines, the host and the service, and lands in `waiter`.
+getnameinfo_start (l: Loop) (ip: Ptr U8) (port: I32) (waiter: Slot): I32 =
+    auv_getnameinfo l.handle ip port waiter.handle
+
+getnameinfo_sync (ip: Ptr U8) (port: I32) (waiter: Slot): I32 =
+    auv_getnameinfo_sync ip port waiter.handle
+
 // --- child processes --------------------------------------------------------------------------------
 
 /// Read and write a slot of a pointer array (an argument vector, for instance).
@@ -496,6 +788,12 @@ ptr_set (p: Ptr U8) (i: Usz) (v: Ptr U8): Unit = auv_ptr_set p i v
 process_spawn (l: Loop) (file: Ptr U8) (args: Ptr U8) (cwd: Ptr U8) (in_pipe: Ptr U8) (out_pipe: Ptr U8) (err_pipe: Ptr U8) (err_out: Ptr U8): Ptr U8 =
     auv_process_spawn l.handle file args cwd in_pipe out_pipe err_pipe err_out
 
+/// The same, with everything else uv_spawn can be told -- the environment, the user, whether
+/// the child is detached, and what each of its three streams is. `opts` is the shim-side record
+/// `Proc.an` fills in; a null one is three ignored streams and nothing else set.
+process_spawn_with (l: Loop) (file: Ptr U8) (args: Ptr U8) (cwd: Ptr U8) (opts: Ptr U8) (err_out: Ptr U8): Ptr U8 =
+    auv_process_spawn2 l.handle file args cwd opts err_out
+
 process_kill (h: Ptr U8) (signum: I32): I32 = auv_process_kill h signum
 process_pid (h: Ptr U8): I32 = auv_process_pid h
 
@@ -506,11 +804,16 @@ buf_read (src: Ptr U8) (off: Usz) (dst: Ptr U8) (n: Usz): Unit = auv_buf_read sr
 buf_write (dst: Ptr U8) (off: Usz) (src: Ptr U8) (n: Usz): Unit = auv_buf_write dst off src n
 
 /// Copy `n` bytes out of a shim-owned buffer into a fresh String.
-buf_string (src: Ptr U8) (n: Usz): String =
+buf_string (src: Ptr U8) (n: Usz): String = buf_string_at src 0usz n
+
+/// The same, starting `off` bytes in. A payload that packs several things -- a datagram's
+/// sender and its bytes -- is read out with this, so no caller has to do pointer arithmetic on
+/// memory the shim owns.
+buf_string_at (src: Ptr U8) (off: Usz) (n: Usz): String =
     if n == 0usz or handle_is_null src then ""
     else
         buf: Ptr Char = malloc n
-        auv_buf_read src 0usz (transmute buf) n
+        auv_buf_read src off (transmute buf) n
         String.from_parts buf (U32 n)
 
 /// Copy an Ante String into a freshly malloc'd NUL-terminated buffer. The caller releases it
@@ -574,6 +877,13 @@ sigint (): I32 = auv_sigint ()
 as_i64 (v: U64): I64 = transmute v
 as_u64 (v: I64): U64 = transmute v
 as_usz (v: I64): Usz = transmute v
+
+// A pointer as an integer and back. One place needs it: a submission has two pointer fields
+// and a datagram send has three things to carry (the socket, the bytes, the destination
+// address), so one of them travels in a scalar slot. Spelled here rather than as a `transmute`
+// at the two sites that pair up.
+ptr_as_i64 (p: Ptr U8): I64 = transmute p
+i64_as_ptr (v: I64): Ptr U8 = transmute v
 
 hrtime_ms (): I64 = auv_hrtime_ms ()
 

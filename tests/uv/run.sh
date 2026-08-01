@@ -9,14 +9,19 @@
 # AddressSanitizer run, or `o3` for just the optimized one. Leak detection stays off at run
 # time: this compiler emits no drop glue, so the tree-wide baseline is "leaks are expected".
 #
-# LEAK BASELINE, measured with ASAN_OPTIONS=detect_leaks=1 on 2026-07-29:
-#   21525 bytes in 951 allocations, 66 distinct reports.
-# All of it is Ante-side and expected: strings built by the suite (uv error names and
-# messages, temp-directory paths), the test harness's own vectors, and the small wrapper cells
-# a Stream and a Listener are made of, which are deliberately not reclaimed -- the handle and
-# wait slot they point at ARE released, by libuv's close callback. NOTHING in the report comes
-# from src/Uv/csrc/auv.c: no handle, request, read buffer or wait slot leaks. That is what a
-# re-measurement should check. A new auv.c frame appearing in a leak stack is a real bug.
+# LEAK BASELINE, measured with ASAN_OPTIONS=detect_leaks=1 on 2026-08-01:
+#   4329 bytes in 217 allocations, 154 distinct reports.
+# All of it is Ante-side and expected: strings built by the suite (uv error names and messages,
+# temp-directory paths, the machine's own answers), the test harness's own vectors, and the
+# small wrapper cells a Stream, a Listener, a Signal, a Udp, a Watch and a Ticker are made of,
+# which are deliberately not reclaimed -- the handle and wait slot they point at ARE released,
+# by libuv's close callback. NOTHING in the report comes from src/Uv/csrc/auv.c: no handle,
+# request, read buffer, datagram or wait slot leaks. That is what a re-measurement should check,
+# with `grep -F csrc/auv.c` and not a regex -- a new auv.c frame in a leak stack is a real bug,
+# and the count alone is not the test. (726913b, the tree before tier 1, measures 1976 bytes in
+# 95 allocations by the same command; the growth since is the scenarios added with each tier.
+# The much larger figure recorded here before that does not reproduce on any tree in this
+# repository and was presumably taken with a different compiler build.)
 #
 # Timing discipline: every ordering assertion uses coarse, well-separated durations (50 ms
 # apart or more) and no test asserts a wall-clock duration.

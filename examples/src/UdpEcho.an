@@ -1,0 +1,77 @@
+// Datagrams: a server and three clients, in one process on the loopback.
+//
+//     ./examples/run.sh udp-echo
+//
+// There is no connection here, and that is the whole difference from the TCP examples. Nothing
+// is accepted, nothing is half-closed, and the server does not know who is talking to it until
+// a datagram arrives -- every one of them carries its own sender, which is exactly what the
+// reply is addressed to.
+//
+// The wait is the same wait, though. `udp_recv` parks its task like `aread` does, so one loop
+// carries the server and every client at once, and a datagram that arrives with nobody parked
+// waits in the kernel rather than being thrown away.
+
+import Local.Uv.Run.run_async, spawn_async
+import Local.Uv.Uv.UvError, uv_error_text
+import Local.Uv.Task.Runtime
+import Local.Uv.Async.Async, sleep
+import Local.Uv.Udp.Udp, copy_udp, udp_socket, udp_local_port, udp_close,
+    udp_recv, udp_send, udp_unref,
+    Datagram, dg_from, dg_port, dg_data
+
+// A number as decimal text. `String` on its own is the type's constructor, so the cast has to
+// be spelled out.
+num (v: I64): String = cast (I32 v)
+
+port (): I32 = 9876
+clients (): I64 = 3
+
+// Answer `n` datagrams, sending each one back where it came from. The socket is UNREFERENCED,
+// so this task -- which would otherwise wait forever -- is not what keeps the program running:
+// when the clients are done, so is the program.
+server (rtp: Ptr Runtime) (n: I64): Unit can Async =
+    match udp_socket rtp "127.0.0.1" (port ())
+    | Error e -> println ("bind failed: " ++ uv_error_text (ref e))
+    | Ok sock ->
+        udp_unref sock
+        println ("echo server on 127.0.0.1:" ++ num (I64 (udp_local_port sock)))
+        var left = n
+        while left > 0 do
+            match udp_recv sock
+            | Error e ->
+                println ("recv failed: " ++ uv_error_text (ref e))
+                left := 0
+            | Ok d ->
+                who = dg_from (ref d) ++ ":" ++ num (I64 (dg_port (ref d)))
+                println ("  from " ++ clone who ++ ": " ++ dg_data (ref d))
+                ignore (udp_send sock (dg_data (ref d)) (dg_from (ref d)) (dg_port (ref d)))
+                left := left - 1
+        udp_close sock
+
+// Say something, wait for it to come back. Port 0: the kernel picks a port for this socket, and
+// the server learns it from the datagram itself.
+client (rtp: Ptr Runtime) (id: I64): Unit can Async =
+    match udp_socket rtp "127.0.0.1" 0
+    | Error e -> println ("client " ++ num id ++ ": " ++ uv_error_text (ref e))
+    | Ok sock ->
+        // Long enough that the server is certainly listening first.
+        sleep 50u64
+        msg = "hello from client " ++ num id
+        match udp_send sock msg "127.0.0.1" (port ())
+        | Error e -> println ("client " ++ num id ++ ": " ++ uv_error_text (ref e))
+        | Ok _u ->
+            match udp_recv sock
+            | Error e -> println ("client " ++ num id ++ ": " ++ uv_error_text (ref e))
+            | Ok back -> println ("client " ++ num id ++ " got back: " ++ dg_data (ref back))
+        udp_close sock
+
+everyone (rtp: Ptr Runtime): Unit can Async =
+    spawn_async rtp server (clients ())
+    var i = 1
+    while i <= clients () do
+        spawn_async rtp client i
+        i := i + 1
+
+main () =
+    run_async everyone
+    println "done"

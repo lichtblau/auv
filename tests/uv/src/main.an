@@ -4,6 +4,11 @@ import Local.TaskTests.run_task_tests
 import Local.SchedTests.run_sched_tests
 import Local.AsyncTests.run_async_tests
 import Local.StreamTests.run_stream_tests
+import Local.SignalTests.run_signal_tests
+import Local.UdpTests.run_udp_tests
+import Local.WatchTests.run_watch_tests
+import Local.TimerTests.run_timer_tests
+import Local.OsTests.run_os_tests
 import Local.FsTests.run_fs_tests
 import Local.ProcTests.run_proc_tests
 
@@ -13,6 +18,11 @@ main () =
     run_sched_tests (mut t)
     run_async_tests (mut t)
     run_stream_tests (mut t)
+    run_signal_tests (mut t)
+    run_udp_tests (mut t)
+    run_watch_tests (mut t)
+    run_timer_tests (mut t)
+    run_os_tests (mut t)
     run_fs_tests (mut t)
     run_proc_tests (mut t)
     t.report ()

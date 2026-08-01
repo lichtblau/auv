@@ -4,22 +4,36 @@
 // collide with each other or with anything else on the machine.
 
 import Local.Harness.TestState, ok, is_i32, is_i64, is_usz
-import Local.Uv.Uv.Completion, copy_completion, handle_is_null, loop_thread_faults,
-    loop_read_stops, UvError, uv_error_text, buf_alloc, buf_free, i32_at, socketpair_fds,
-    fd_close, as_i64
+import Local.Uv.Uv.Completion, copy_completion, handle_is_null, loop_alive, loop_thread_faults,
+    loop_read_stops, UvError, uv_error_text, uv_err_name_of, buf_alloc, buf_free, i32_at,
+    socketpair_fds, fd_close, as_i64, cstr_of_string, getpid
 import Local.Uv.Task.Runtime, rt_new, rt_free, rt_loop, rt_live_count, rt_task_count,
     spawn_default, spawn, run, shutdown, cancel, sleep_ms
 import Local.Uv.Async.Async, run_uv, sleep
 import Local.Uv.Stream.Stream, copy_stream, stream_free, stream_close, stream_is_null,
     stream_adopt_fd, stream_at_eof, stream_pending_writes,
-    Listener, copy_listener, listener_bind, listener_free, listener_port,
-    accept, connect, AsyncRead, aread, stream_async_read,
+    stream_local_addr, stream_peer_addr, stream_local_port, stream_peer_port,
+    stream_local_path, stream_peer_path, stream_peer_cred, stream_nodelay, stream_keepalive,
+    PeerCred, copy_peercred, pc_pid, pc_uid, pc_gid, socket_readable, socket_writable,
+    Listener, copy_listener, listener_bind, listener_bind_path, listener_free, listener_close,
+    listener_port, listener_is_path, listener_path, listener_addr, listener_chmod,
+    listener_ref, listener_unref, listener_has_ref,
+    accept, connect, connect_path, AsyncRead, aread, stream_async_read,
     AsyncWrite, awrite, stream_async_write, ashutdown, read_all
 import Std.Vec.Vec, empty, push, len
 import Std.C.malloc, free
 import Std.String.eq_string
 
 export run_stream_tests
+
+// Clearing a leftover socket file needs no loop and no task, so it goes straight to libc --
+// the same way SchedTests reaches for pipe(2) to build its fixtures.
+c_unlink = extern "unlink": fn (Ptr U8) -> I32
+
+unlink_path (path: ref String): Unit =
+    p = cstr_of_string path
+    ignore (c_unlink p)
+    buf_free p
 
 // --- shared shapes ---------------------------------------------------------------------------
 
@@ -185,6 +199,341 @@ test_echo (t: mut TestState): Unit =
     free_log lg
     free (transmute txt)
     free (transmute lp)
+
+// --- the same round trip over IPv6 -------------------------------------------------------------
+//
+// `connect` and `listener_bind` take a numeric address of either family, which they did not
+// always: both went through uv_ip4_addr alone, so the v6 addresses `resolve` reports could not
+// be handed back to `connect`. This is that gap, closed and kept closed.
+
+// Connect to whatever address the scenario left in the shared text cell, rather than to a
+// hardcoded one, so that one client serves both families.
+echo_client_at (p: Ptr U8): Unit =
+    ctl = ctl_of p
+    run_uv ctl.rt fn () ->
+        match connect ctl.rt (text_get ctl.text) ctl.port
+        | Error _e -> log_push ctl.log -1
+        | Ok s ->
+            msg = "hello over v6"
+            match awrite s msg
+            | Error _e -> log_push ctl.log -2
+            | Ok _ ->
+                ignore (ashutdown s)
+                match read_all s
+                | Ok back -> log_push ctl.log (if back == msg then 10 else -3)
+                | Error _e -> log_push ctl.log -4
+            stream_free s
+
+test_ipv6_echo (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    txt = new_text ()
+    lp = new_listener_cell ()
+
+    match listener_bind rtp "::1" 0 8
+    | Error e ->
+        // A machine with no IPv6 loopback is a legitimate environment rather than a failure of
+        // the binding, and it says so by name. Anything else here is a real error.
+        nm = uv_err_name_of e.code
+        t.ok ("ipv6: no IPv6 loopback on this machine (" ++ clone nm ++ "), skipped")
+             (nm == "EAFNOSUPPORT" or nm == "EADDRNOTAVAIL")
+    | Ok l ->
+        ptr_store lp l
+        port = listener_port (ptr_to_mut lp)
+        t.ok "ipv6: the kernel picked a port on the v6 socket" (port > 0)
+        text_set txt "::1"
+        ctls = new_ctls 2usz
+        ptr_store (ctl_slot ctls 0usz) (Ctl rtp lg txt port 1 lp)
+        ignore (spawn_default rtp (transmute (echo_server : fn (Ptr U8) -> Unit))
+                                  (transmute (ctl_slot ctls 0usz)))
+        ptr_store (ctl_slot ctls 1usz) (Ctl rtp lg txt port 0 lp)
+        ignore (spawn_default rtp (transmute (echo_client_at : fn (Ptr U8) -> Unit))
+                                  (transmute (ctl_slot ctls 1usz)))
+        run rtp
+
+        var echoed = false
+        var served = false
+        var k = 0usz
+        while k < log_len lg do
+            if log_at lg k == 10 then echoed := true
+            if log_at lg k == 1 then served := true
+            k := k + 1usz
+        t.ok "ipv6: the client's bytes came back over ::1" echoed
+        t.ok "ipv6: the connection was served" served
+        listener_free (deref_ptr lp)
+        free (transmute ctls)
+
+    shutdown rtp
+    rt_free rtp
+    free_log lg
+    free (transmute txt)
+    free (transmute lp)
+
+// --- the same round trip over a unix-domain socket -------------------------------------------
+//
+// A socket on the filesystem rather than on a port: `listener_bind_path` and `connect_path`,
+// with everything between them the ordinary Stream API. The path carries the process id, so
+// two copies of the suite cannot collide.
+
+// Connect to the path in the shared text cell and do the echo exchange over it.
+echo_client_path (p: Ptr U8): Unit =
+    ctl = ctl_of p
+    run_uv ctl.rt fn () ->
+        match connect_path ctl.rt (text_get ctl.text)
+        | Error _e -> log_push ctl.log -1
+        | Ok s ->
+            msg = "hello over a path"
+            match awrite s msg
+            | Error _e -> log_push ctl.log -2
+            | Ok _ ->
+                ignore (ashutdown s)
+                match read_all s
+                | Ok back -> log_push ctl.log (if back == msg then 10 else -3)
+                | Error _e -> log_push ctl.log -4
+            stream_free s
+
+// Nothing is listening on this path -- the listener that was there has been closed, and libuv
+// unlinked it. Connecting has to fail rather than hang.
+gone_client (p: Ptr U8): Unit =
+    ctl = ctl_of p
+    run_uv ctl.rt fn () ->
+        match connect_path ctl.rt (text_get ctl.text)
+        | Error e -> log_push ctl.log (I64 e.code)
+        | Ok s ->
+            log_push ctl.log -5
+            stream_free s
+
+test_unix_socket_echo (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    txt = new_text ()
+    lp = new_listener_cell ()
+    sock = "/tmp/uv-lane-${getpid ()}.sock"
+
+    // A leftover from a killed run would make the bind fail with EADDRINUSE.
+    unlink_path sock
+    match listener_bind_path rtp sock 8
+    | Error e -> t.ok ("unix: bind failed: " ++ uv_error_text (ref e)) false
+    | Ok l ->
+        ptr_store lp l
+        t.ok "unix: the listener knows it is a path" (listener_is_path (ptr_to_mut lp))
+        t.ok "unix: and reports it" (listener_path (ptr_to_mut lp) == clone sock)
+        t.is_i32 "unix: a path listener has no port" (listener_port (ptr_to_mut lp)) -1
+        text_set txt (clone sock)
+        ctls = new_ctls 2usz
+        ptr_store (ctl_slot ctls 0usz) (Ctl rtp lg txt 0 1 lp)
+        ignore (spawn_default rtp (transmute (echo_server : fn (Ptr U8) -> Unit))
+                                  (transmute (ctl_slot ctls 0usz)))
+        ptr_store (ctl_slot ctls 1usz) (Ctl rtp lg txt 0 0 lp)
+        ignore (spawn_default rtp (transmute (echo_client_path : fn (Ptr U8) -> Unit))
+                                  (transmute (ctl_slot ctls 1usz)))
+        run rtp
+
+        var echoed = false
+        var served = false
+        var k = 0usz
+        while k < log_len lg do
+            if log_at lg k == 10 then echoed := true
+            if log_at lg k == 1 then served := true
+            k := k + 1usz
+        t.ok "unix: the client's bytes came back over the socket" echoed
+        t.ok "unix: the connection was served" served
+
+        // Closing unlinks the path -- libuv does that for whatever uv_pipe_bind created -- so
+        // a connect afterwards has nothing to reach. The loop has to run for the close to
+        // land, which the client task below provides.
+        listener_free (deref_ptr lp)
+        ctls2 = new_ctls 1usz
+        ptr_store (ctl_slot ctls2 0usz) (Ctl rtp lg txt 0 0 lp)
+        ignore (spawn_default rtp (transmute (gone_client : fn (Ptr U8) -> Unit))
+                                  (transmute (ctl_slot ctls2 0usz)))
+        run rtp
+        // ENOENT: the socket file is gone, which is the proof it was unlinked.
+        t.is_i64 "unix: closing the listener took the socket file with it"
+                 (log_at lg (log_len lg - 1usz)) -2
+        free (transmute ctls)
+        free (transmute ctls2)
+
+    shutdown rtp
+    rt_free rtp
+    free_log lg
+    free (transmute txt)
+    free (transmute lp)
+
+// --- what a connection knows about itself ------------------------------------------------------
+//
+// Both ends of a TCP connection, from the client's side, plus the two options worth setting on
+// one. `stream_peer_port` is the listener's, `stream_local_port` is whatever the kernel gave
+// this socket -- and they are different numbers, which is the whole point of asking.
+
+opts_client (p: Ptr U8): Unit =
+    ctl = ctl_of p
+    run_uv ctl.rt fn () ->
+        match connect ctl.rt "127.0.0.1" ctl.port
+        | Error _e -> log_push ctl.log -1
+        | Ok s ->
+            log_push ctl.log (if stream_peer_addr s == "127.0.0.1" then 1 else -2)
+            log_push ctl.log (if stream_peer_port s == ctl.port then 1 else -3)
+            log_push ctl.log (if stream_local_addr s == "127.0.0.1" then 1 else -4)
+            log_push ctl.log (if stream_local_port s > 0 and stream_local_port s != ctl.port
+                              then 1 else -5)
+            // A TCP socket has no path, and asking is not an error.
+            log_push ctl.log (if stream_local_path s == "" then 1 else -6)
+            match stream_nodelay s true
+            | Ok _u -> log_push ctl.log 1
+            | Error _e -> log_push ctl.log -7
+            match stream_keepalive s true 30
+            | Ok _u -> log_push ctl.log 1
+            | Error _e -> log_push ctl.log -8
+            ignore (awrite s "hello stream")
+            ignore (ashutdown s)
+            ignore (read_all s)
+            stream_free s
+
+test_socket_options (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    txt = new_text ()
+    lp = new_listener_cell ()
+
+    match listener_bind rtp "127.0.0.1" 0 8
+    | Error e -> t.ok ("socket_options: bind failed: " ++ uv_error_text (ref e)) false
+    | Ok l ->
+        ptr_store lp l
+        port = listener_port (ptr_to_mut lp)
+        t.ok "socket_options: the listener reports its address"
+             (listener_addr (ptr_to_mut lp) == "127.0.0.1")
+        t.ok "socket_options: and has no path" (listener_path (ptr_to_mut lp) == "")
+        ctls = new_ctls 2usz
+        ptr_store (ctl_slot ctls 0usz) (Ctl rtp lg txt port 1 lp)
+        ignore (spawn_default rtp (transmute (echo_server : fn (Ptr U8) -> Unit))
+                                  (transmute (ctl_slot ctls 0usz)))
+        ptr_store (ctl_slot ctls 1usz) (Ctl rtp lg txt port 0 lp)
+        ignore (spawn_default rtp (transmute (opts_client : fn (Ptr U8) -> Unit))
+                                  (transmute (ctl_slot ctls 1usz)))
+        run rtp
+
+        t.is_i64 "socket_options: the peer address is the one connected to" (log_at lg 0usz) 1
+        t.is_i64 "socket_options: and the peer port" (log_at lg 1usz) 1
+        t.is_i64 "socket_options: the local address is the loopback too" (log_at lg 2usz) 1
+        t.is_i64 "socket_options: on a port of its own" (log_at lg 3usz) 1
+        t.is_i64 "socket_options: a TCP socket has no path" (log_at lg 4usz) 1
+        t.is_i64 "socket_options: nodelay set" (log_at lg 5usz) 1
+        t.is_i64 "socket_options: keepalive set" (log_at lg 6usz) 1
+        listener_free (deref_ptr lp)
+        free (transmute ctls)
+
+    shutdown rtp
+    rt_free rtp
+    free_log lg
+    free (transmute txt)
+    free (transmute lp)
+
+// --- who is at the other end of a unix-domain socket --------------------------------------------
+//
+// The one authentication a local socket can do on its own. Both ends are this process, so the
+// kernel's answer is checkable exactly: the pid it reports is this program's.
+
+cred_server (p: Ptr U8): Unit =
+    ctl = ctl_of p
+    run_uv ctl.rt fn () ->
+        match accept ctl.rt (ptr_to_mut ctl.listener)
+        | Error _e -> log_push ctl.log -1
+        | Ok s ->
+            match stream_peer_cred s
+            | Error _e -> log_push ctl.log -2
+            | Ok cred ->
+                log_push ctl.log (if pc_pid cred == getpid () then 20 else -3)
+                log_push ctl.log (if pc_uid cred >= 0 then 21 else -4)
+            // The path is readable from both ends of a connected pair.
+            log_push ctl.log (if stream_local_path s == text_get ctl.text then 22 else -5)
+            ignore (ashutdown s)
+            stream_free s
+
+cred_client (p: Ptr U8): Unit =
+    ctl = ctl_of p
+    run_uv ctl.rt fn () ->
+        match connect_path ctl.rt (text_get ctl.text)
+        | Error _e -> log_push ctl.log -6
+        | Ok s ->
+            log_push ctl.log (if stream_peer_path s == text_get ctl.text then 23 else -7)
+            ignore (read_all s)
+            stream_free s
+
+test_unix_peer_cred (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    txt = new_text ()
+    lp = new_listener_cell ()
+    sock = "/tmp/uv-cred-${getpid ()}.sock"
+    unlink_path sock
+
+    match listener_bind_path rtp sock 8
+    | Error e -> t.ok ("unix_cred: bind failed: " ++ uv_error_text (ref e)) false
+    | Ok l ->
+        ptr_store lp l
+        // Who may reach it. The default is the umask's answer, which for a socket meant to be
+        // reached by others is usually not the one wanted.
+        match listener_chmod (ptr_to_mut lp) (socket_readable () + socket_writable ())
+        | Ok _u -> t.ok "unix_cred: the socket's mode can be set" true
+        | Error e -> t.ok ("unix_cred: chmod: " ++ uv_error_text (ref e)) false
+        text_set txt (clone sock)
+        ctls = new_ctls 2usz
+        ptr_store (ctl_slot ctls 0usz) (Ctl rtp lg txt 0 1 lp)
+        ignore (spawn_default rtp (transmute (cred_server : fn (Ptr U8) -> Unit))
+                                  (transmute (ctl_slot ctls 0usz)))
+        ptr_store (ctl_slot ctls 1usz) (Ctl rtp lg txt 0 0 lp)
+        ignore (spawn_default rtp (transmute (cred_client : fn (Ptr U8) -> Unit))
+                                  (transmute (ctl_slot ctls 1usz)))
+        run rtp
+
+        var saw_pid = false
+        var saw_uid = false
+        var saw_local = false
+        var saw_peer = false
+        var k = 0usz
+        while k < log_len lg do
+            if log_at lg k == 20 then saw_pid := true
+            if log_at lg k == 21 then saw_uid := true
+            if log_at lg k == 22 then saw_local := true
+            if log_at lg k == 23 then saw_peer := true
+            k := k + 1usz
+        t.ok "unix_cred: the peer is this very process" saw_pid
+        t.ok "unix_cred: with a user id" saw_uid
+        t.ok "unix_cred: the server knows the path it is bound to" saw_local
+        t.ok "unix_cred: and the client the path it reached" saw_peer
+        listener_free (deref_ptr lp)
+        free (transmute ctls)
+
+    shutdown rtp
+    rt_free rtp
+    free_log lg
+    free (transmute txt)
+    free (transmute lp)
+
+// --- a listener that does not keep the loop alive ------------------------------------------------
+//
+// Asked of the LOOP rather than of a program's running time, so this proves the mechanism
+// without depending on anything finishing: `loop_alive` is the exact question `run` asks itself
+// before it decides to keep going.
+
+test_listener_unref (t: mut TestState): Unit =
+    rtp = rt_new ()
+    match listener_bind rtp "127.0.0.1" 0 16
+    | Error e -> t.ok ("listener_unref: bind failed: " ++ uv_error_text (ref e)) false
+    | Ok l ->
+        t.ok "listener_unref: a fresh listener counts" (listener_has_ref l)
+        t.ok "listener_unref: and is a reason to keep running" (loop_alive (rt_loop rtp))
+        listener_unref l
+        t.ok "listener_unref: unreferenced, it stops counting" (not (listener_has_ref l))
+        t.ok "listener_unref: and the loop has nothing left to wait for"
+             (not (loop_alive (rt_loop rtp)))
+        listener_ref l
+        t.ok "listener_unref: referencing it again is a reason once more"
+             (loop_alive (rt_loop rtp))
+        listener_close l
+    shutdown rtp
+    rt_free rtp
 
 // --- a transfer larger than any pipe buffer -------------------------------------------------------
 
@@ -443,6 +792,11 @@ test_close_while_reading (t: mut TestState): Unit =
 run_stream_tests (t: mut TestState): Unit =
     test_close_while_reading t
     test_echo t
+    test_ipv6_echo t
+    test_unix_socket_echo t
+    test_socket_options t
+    test_unix_peer_cred t
+    test_listener_unref t
     test_large_transfer t
     test_client_vanishes t
     test_backpressure t

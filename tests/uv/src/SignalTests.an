@@ -1,0 +1,216 @@
+// Signal suite: a watch as a resource a task parks on.
+//
+// Every signal here is one this process sends to ITSELF (SIGUSR1, SIGUSR2), so the suite needs
+// no outside help and disturbs nothing else. Watching replaces the default disposition, which
+// for these two is "terminate", so a watch is always open before anything is raised.
+
+import Local.Harness.TestState, ok, is_i32, is_i64, is_usz
+import Local.Uv.Uv.UvError, uv_error_text, uv_err_name_of, handle_is_null, loop_alive,
+    loop_thread_faults, getpid, kill_pid, as_i64, as_u64
+import Local.Uv.Task.Runtime, rt_new, rt_free, rt_loop, rt_live_count, rt_task_count,
+    spawn_default, run, shutdown, cancel, sleep_ms
+import Local.Uv.Async.Async, run_uv, blocking, sleep, sleep_unref
+import Local.Uv.Signal.Signal, copy_signal, signal_watch, await_signal, signal_close,
+    signal_ref, signal_unref, signal_has_ref, signal_signum, sig_usr1, sig_usr2
+import Std.Vec.Vec, empty, push, len
+import Std.C.malloc, free
+import Std.String.eq_string
+
+export run_signal_tests
+
+// --- shared shapes ---------------------------------------------------------------------------
+
+type Arg =
+    rt: Ptr Runtime
+    log: Ptr (Vec I64)
+    a: I64
+    b: I64
+    sig: Ptr Signal
+
+impl copy_sigarg: Copy Arg with (.*) = deref
+
+arg_of (p: Ptr U8): Arg = deref_ptr (transmute p : Ptr Arg)
+
+log_push (a: Arg) (v: I64): Unit =
+    lg = ptr_to_mut a.log
+    lg.push v
+
+new_log (): Ptr (Vec I64) =
+    p: Ptr (Vec I64) = malloc (size_of (MkType : Type (Vec I64)))
+    ptr_store p (Vec.empty ())
+    p
+
+log_at (p: Ptr (Vec I64)) (i: Usz): I64 =
+    lg = ptr_to_mut p
+    if i >= lg.len then -1 else deref_ptr (offset lg.data i)
+
+log_len (p: Ptr (Vec I64)): Usz = (ptr_to_mut p).len
+
+free_log (p: Ptr (Vec I64)): Unit =
+    lg = ptr_to_mut p
+    if not (handle_is_null (transmute lg.data)) then free (transmute lg.data)
+    free (transmute p)
+
+new_args (n: Usz): Ptr Arg = malloc (n * size_of (MkType : Type Arg))
+arg_slot (base: Ptr Arg) (i: Usz): Ptr Arg = offset base i
+
+new_signal_cell (): Ptr Signal = malloc (size_of (MkType : Type Signal))
+
+// A deadline that costs nothing when it is not needed. The wait is UNREFERENCED, so a scenario
+// whose tasks all finish leaves this one parked and `run` returns regardless; only shutdown
+// ever collects it. When it IS needed -- a signal that was supposed to be held and was not --
+// it cancels the waiter, so the scenario fails on its assertions instead of hanging the suite
+// on a park nothing will ever complete. arg.a is the task to cancel, arg.b the deadline.
+watchdog (p: Ptr U8): Unit =
+    arg = arg_of p
+    run_uv arg.rt fn () ->
+        if sleep_unref (as_u64 arg.b) then cancel arg.rt (as_u64 arg.a)
+
+// --- awaiting a signal, and finding one already waiting -----------------------------------------
+
+// Take two SIGUSR1s. The second is raised while this task is off sleeping, so nobody is parked
+// on the watch when it lands: it has to be HELD in the watch's own slot and handed over by the
+// next await. That is the same rule `accept` follows, and the reason a watch parks on its own
+// slot rather than on the task's.
+watcher (p: Ptr U8): Unit =
+    arg = arg_of p
+    run_uv arg.rt fn () ->
+        match signal_watch arg.rt (sig_usr1 ())
+        | Error _e -> log_push arg -1
+        | Ok sg ->
+            log_push arg (I64 (signal_signum sg))
+            match await_signal sg
+            | Ok n -> log_push arg (I64 n)
+            | Error e -> log_push arg (I64 e.code)
+            sleep 150u64
+            match await_signal sg
+            | Ok n -> log_push arg (I64 n)
+            | Error e -> log_push arg (I64 e.code)
+            signal_close sg
+
+// One signal while the watcher is parked, one while it is not.
+raiser (p: Ptr U8): Unit =
+    arg = arg_of p
+    run_uv arg.rt fn () ->
+        sleep 50u64
+        ignore (kill_pid (getpid ()) (sig_usr1 ()))
+        sleep 50u64
+        ignore (kill_pid (getpid ()) (sig_usr1 ()))
+
+test_await_signal (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    args = new_args 3usz
+    ptr_store (arg_slot args 0usz) (Arg rtp lg 0 0 (transmute 0usz))
+    id = spawn_default rtp (transmute (watcher : fn (Ptr U8) -> Unit))
+                           (transmute (arg_slot args 0usz))
+    ptr_store (arg_slot args 1usz) (Arg rtp lg 0 0 (transmute 0usz))
+    ignore (spawn_default rtp (transmute (raiser : fn (Ptr U8) -> Unit))
+                              (transmute (arg_slot args 1usz)))
+    ptr_store (arg_slot args 2usz) (Arg rtp lg (as_i64 id) 3000 (transmute 0usz))
+    ignore (spawn_default rtp (transmute (watchdog : fn (Ptr U8) -> Unit))
+                              (transmute (arg_slot args 2usz)))
+    run rtp
+
+    t.is_usz "await_signal: the watcher took two signals" (log_len lg) 3usz
+    t.is_i64 "await_signal: the watch knows its own number" (log_at lg 0usz) (I64 (sig_usr1 ()))
+    t.is_i64 "await_signal: the first arrived while it was parked"
+             (log_at lg 1usz) (I64 (sig_usr1 ()))
+    t.is_i64 "await_signal: the second was held until it came back"
+             (log_at lg 2usz) (I64 (sig_usr1 ()))
+    t.is_i64 "await_signal: no completion arrived off the loop thread"
+             (loop_thread_faults (rt_loop rtp)) 0
+    shutdown rtp
+    free_log lg
+    rt_free rtp
+    free (transmute args)
+
+// --- closing a watch out from under a parked task -------------------------------------------------
+
+// Park on a signal nobody will send. A sibling closes the watch, which has to wake this task
+// rather than leave it parked on a handle that is going away.
+lonely_waiter (p: Ptr U8): Unit =
+    arg = arg_of p
+    run_uv arg.rt fn () ->
+        match signal_watch arg.rt (sig_usr2 ())
+        | Error _e -> log_push arg -1
+        | Ok sg ->
+            ptr_store arg.sig sg
+            match await_signal sg
+            | Ok n -> log_push arg (I64 n)
+            | Error e -> log_push arg (I64 e.code)
+
+sig_closer (p: Ptr U8): Unit =
+    arg = arg_of p
+    ignore (sleep_ms arg.rt 50)
+    signal_close (deref_ptr arg.sig)
+
+test_signal_close_wakes (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    cell = new_signal_cell ()
+    args = new_args 2usz
+    ptr_store (arg_slot args 0usz) (Arg rtp lg 0 0 cell)
+    ignore (spawn_default rtp (transmute (lonely_waiter : fn (Ptr U8) -> Unit))
+                              (transmute (arg_slot args 0usz)))
+    ptr_store (arg_slot args 1usz) (Arg rtp lg 0 0 cell)
+    ignore (spawn_default rtp (transmute (sig_closer : fn (Ptr U8) -> Unit))
+                              (transmute (arg_slot args 1usz)))
+    run rtp
+
+    t.is_usz "signal_close: the waiter woke" (log_len lg) 1usz
+    // EBADF: the wait ended because the watch went away, which is not a signal.
+    t.is_i64 "signal_close: with the watch reported gone" (log_at lg 0usz) -9
+    t.is_usz "signal_close: nothing is left parked" (rt_live_count rtp) 0usz
+    shutdown rtp
+    free_log lg
+    rt_free rtp
+    free (transmute cell)
+    free (transmute args)
+
+// --- a watch that does not keep the loop alive ------------------------------------------------------
+//
+// Asked of the LOOP directly: `loop_alive` is the exact question `run` asks itself before it
+// decides whether to keep going, so this proves the mechanism without waiting for anything.
+
+test_signal_unref (t: mut TestState): Unit =
+    rtp = rt_new ()
+    match signal_watch rtp (sig_usr2 ())
+    | Error e -> t.ok ("signal_unref: the watch failed: " ++ uv_error_text (ref e)) false
+    | Ok sg ->
+        t.ok "signal_unref: a fresh watch counts" (signal_has_ref sg)
+        t.ok "signal_unref: and is a reason to keep running" (loop_alive (rt_loop rtp))
+        signal_unref sg
+        t.ok "signal_unref: unreferenced, it stops counting" (not (signal_has_ref sg))
+        t.ok "signal_unref: and the loop has nothing left to wait for"
+             (not (loop_alive (rt_loop rtp)))
+        signal_ref sg
+        t.ok "signal_unref: referencing it again is a reason once more" (loop_alive (rt_loop rtp))
+        signal_close sg
+    shutdown rtp
+    rt_free rtp
+
+// --- the handler with no loop ---------------------------------------------------------------------
+
+// `blocking` satisfies what plain libc can do, and watching for a signal is not that. It says
+// so -- ENOSYS -- rather than returning an empty completion, which would read as a signal that
+// arrived carrying no number.
+test_signal_blocking (t: mut TestState): Unit =
+    rtp = rt_new ()
+    match signal_watch rtp (sig_usr2 ())
+    | Error e -> t.ok ("signal_blocking: the watch failed: " ++ uv_error_text (ref e)) false
+    | Ok sg ->
+        match blocking fn () -> await_signal sg
+        | Ok _n -> t.ok "signal_blocking: awaiting a signal with no loop fails" false
+        | Error e ->
+            t.ok "signal_blocking: awaiting a signal with no loop fails" true
+            t.ok "signal_blocking: and says which way" (uv_err_name_of e.code == "ENOSYS")
+        signal_close sg
+    shutdown rtp
+    rt_free rtp
+
+run_signal_tests (t: mut TestState): Unit =
+    test_await_signal t
+    test_signal_close_wakes t
+    test_signal_unref t
+    test_signal_blocking t

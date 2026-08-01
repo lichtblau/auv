@@ -14,27 +14,35 @@
 //             No loop, no task, no coroutine: the whole program runs on the caller's stack.
 //   mock      replays a scripted list of completions, for tests that want no I/O at all.
 //
-// A program written against `Async` is the same program under all three.
+// A program written against `Async` is the same program under all three -- as far as it stays
+// inside what all three can do. Some operations exist only because a loop is watching (a signal
+// is the first of them), and those report ENOSYS under `blocking` rather than pretending to
+// have happened. Every op that can be satisfied without a loop still is.
 
 import Local.Uv.Uv.Loop, copy_loop, Slot, copy_slot, slot_new, slot_free, slot_rearm,
     slot_state, slot_completion, st_done,
     Completion, copy_completion,
     completion_none, k_none, k_timer, k_cancelled, k_read, k_write, k_connect, k_connection,
-    k_shutdown, k_eof, k_fs, k_addrinfo, k_exit, k_closed,
+    k_shutdown, k_eof, k_fs, k_addrinfo, k_exit, k_closed, k_signal, k_dgram, k_fsevent,
     handle_null, handle_is_null, handle_set_slot, handle_slot, close_handle,
     timer_new, timer_start, timer_stop, uv_sleep_ms, as_i64, as_usz,
-    read_start, stream_write, stream_shutdown, tcp_connect_cstr,
-    fs_submit, fs_sync, getaddrinfo_start, getaddrinfo_sync
-import Local.Uv.Task.Runtime, rt_loop, park, park_on, current_slot, task_sleep
+    ptr_as_i64, i64_as_ptr,
+    read_start, stream_write, stream_shutdown, tcp_connect_cstr, pipe_connect_cstr,
+    udp_recv_start, udp_send,
+    fs_submit, fs_sync, getaddrinfo_start, getaddrinfo_sync, getnameinfo_start, getnameinfo_sync
+import Local.Uv.Task.Runtime, rt_loop, park, park_on, current_slot, task_sleep, task_sleep_unref
 import Std.Vec.Vec, len
 
 export
     Async, submit,
-    Submission, copy_submission, sub_none, sub_op1, sub_op2, sub_op3, sub_fs, sub_addrinfo,
+    Submission, copy_submission, sub_none, sub_op1, sub_op2, sub_op3, sub_sleep, sub_udp_send,
+    sub_fs, sub_addrinfo, sub_nameinfo,
     op_none, op_sleep, op_read, op_write, op_connect, op_accept, op_shutdown,
-    op_fs, op_addrinfo, op_wait_exit,
+    op_fs, op_addrinfo, op_wait_exit, op_signal, op_pipe_connect, op_udp_recv, op_udp_send,
+    op_watch, op_nameinfo,
+    e_nosys,
     run_uv, blocking, mock, perform, perform_blocking,
-    sleep, sleep_result
+    sleep, sleep_result, sleep_unref
 
 // --- the effect ----------------------------------------------------------------------------------
 
@@ -64,12 +72,36 @@ op_shutdown (): I32 = 6
 op_fs (): I32 = 7
 op_addrinfo (): I32 = 8
 op_wait_exit (): I32 = 9
+op_signal (): I32 = 10
+op_pipe_connect (): I32 = 11
+op_udp_recv (): I32 = 12
+op_udp_send (): I32 = 13
+/// Park on a handle that goes on producing events -- a file watch, a repeating timer. `a` is
+/// the completion kind it produces, which `park_on_watch` needs to tell a real event from a
+/// cancellation; `p` is the handle.
+op_watch (): I32 = 14
+op_nameinfo (): I32 = 15
+
+/// ENOSYS. What an operation that has no synchronous twin reports under `blocking` -- see the
+/// note on `perform_blocking`.
+e_nosys (): I32 = -38
 
 sub_none (op: I32): Submission = Submission op 0 0 0 0 (handle_null ()) (handle_null ())
 sub_op1 (op: I32) (a: I64): Submission = Submission op a 0 0 0 (handle_null ()) (handle_null ())
 sub_op2 (op: I32) (a: I64) (p: Ptr U8): Submission = Submission op a 0 0 0 p (handle_null ())
 sub_op3 (op: I32) (a: I64) (b: I64) (p: Ptr U8) (q: Ptr U8): Submission =
     Submission op a b 0 0 p q
+
+/// A sleep submission. `unref` asks for a timer that does not keep the loop alive; it is read
+/// only by `run_uv`, since neither of the other two handlers has a loop to keep alive at all.
+sub_sleep (ms: I64) (unref: Bool): Submission =
+    Submission (op_sleep ()) ms (if unref then 1 else 0) 0 0 (handle_null ()) (handle_null ())
+
+/// A datagram send. `p` is the socket and `q` the bytes; the destination has to go somewhere,
+/// and a submission has exactly two pointer fields, so the ADDRESS travels as a scalar and its
+/// port beside it. It is borrowed for the duration of the call like every other buffer here.
+sub_udp_send (h: Ptr U8) (bytes: Ptr U8) (n: I64) (addr: Ptr U8) (port: I32): Submission =
+    Submission (op_udp_send ()) n (ptr_as_i64 addr) (I64 port) 0 h bytes
 
 /// A filesystem submission: `sub` picks the call, the rest are its arguments.
 sub_fs (sub: I64) (a: I64) (b: I64) (c: I64) (p: Ptr U8) (q: Ptr U8): Submission =
@@ -79,15 +111,27 @@ sub_fs (sub: I64) (a: I64) (b: I64) (c: I64) (p: Ptr U8) (q: Ptr U8): Submission
 sub_addrinfo (host: Ptr U8) (service: Ptr U8): Submission =
     Submission (op_addrinfo ()) 0 0 0 0 host service
 
+/// The reverse: an address and a port, back to names.
+sub_nameinfo (ip: Ptr U8) (port: I32): Submission =
+    Submission (op_nameinfo ()) (I64 port) 0 0 0 ip (handle_null ())
+
 // --- the op library ------------------------------------------------------------------------------
 
 /// Suspend for `ms` milliseconds.
 sleep (ms: U64): Unit can Async =
-    ignore (submit (sub_op1 (op_sleep ()) (as_i64 ms)))
+    ignore (submit (sub_sleep (as_i64 ms) false))
 
 /// Suspend for `ms` milliseconds and report how the wait ended: false when it was cancelled.
 sleep_result (ms: U64): Bool can Async =
-    c = submit (sub_op1 (op_sleep ()) (as_i64 ms))
+    c = submit (sub_sleep (as_i64 ms) false)
+    c.kind != k_cancelled ()
+
+/// The same wait, on a timer that does not keep the loop alive -- what a heartbeat sleeps on.
+/// A task looping around this ticks for as long as the program has other work and is cancelled
+/// out of its wait when the program is done; `sleep` in the same loop would mean it never is.
+/// False when the wait was cancelled, which is a loop's cue to return.
+sleep_unref (ms: U64): Bool can Async =
+    c = submit (sub_sleep (as_i64 ms) true)
     c.kind != k_cancelled ()
 
 // --- run_uv --------------------------------------------------------------------------------------
@@ -103,7 +147,8 @@ sleep_result (ms: U64): Bool can Async =
 /// (write, connect, shutdown) park on the task's own slot and pass it to the request, so
 /// their completions never land in the middle of somebody's read.
 perform (rtp: Ptr Runtime) (s: Submission): Completion =
-    if s.op == op_sleep () then task_sleep rtp s.a
+    if s.op == op_sleep () then
+        if s.b != 0 then task_sleep_unref rtp s.a else task_sleep rtp s.a
     else if s.op == op_read () then
         slot = handle_slot s.p
         // A chunk already waiting means the stream stopped reading when it arrived; take
@@ -134,11 +179,36 @@ perform (rtp: Ptr Runtime) (s: Submission): Completion =
         r = tcp_connect_cstr s.p s.q (I32 s.a) mine
         if r != 0 then Completion (k_connect ()) (I64 r) 0 (handle_null ())
         else park_on rtp mine
+    else if s.op == op_pipe_connect () then
+        // The same, by path. `pipe_connect_cstr` reports nothing synchronously -- every
+        // outcome is the completion -- so the error arm here is for a failed allocation only.
+        mine = current_slot rtp
+        slot_rearm mine
+        r = pipe_connect_cstr s.p s.q mine
+        if r != 0 then Completion (k_connect ()) (I64 r) 0 (handle_null ())
+        else park_on rtp mine
     else if s.op == op_wait_exit () then
         // The exit lands in the process handle's own slot, which holds it until it is read.
         slot = handle_slot s.p
         if slot_state slot != st_done () then slot_rearm slot
         park_on rtp slot
+    else if s.op == op_udp_recv () then
+        // A datagram socket reads exactly as a stream does, backpressure included: the shim
+        // stops receiving when a datagram arrives with nobody parked, so the next one waits in
+        // the kernel rather than being dropped here.
+        slot = handle_slot s.p
+        if slot_state slot != st_done () then
+            slot_rearm slot
+            ignore (udp_recv_start s.p)
+        park_on rtp slot
+    else if s.op == op_udp_send () then
+        mine = current_slot rtp
+        slot_rearm mine
+        r = udp_send s.p s.q (as_usz s.a) (i64_as_ptr s.b) (I32 s.c) mine
+        if r != 0 then Completion (k_write ()) (I64 r) 0 (handle_null ())
+        else park_on rtp mine
+    else if s.op == op_signal () then park_on_watch rtp s.p (k_signal ())
+    else if s.op == op_watch () then park_on_watch rtp s.p (I32 s.a)
     else if s.op == op_fs () then
         mine = current_slot rtp
         slot_rearm mine
@@ -151,7 +221,38 @@ perform (rtp: Ptr Runtime) (s: Submission): Completion =
         r = getaddrinfo_start (rt_loop rtp) s.p s.q mine
         if r != 0 then Completion (k_addrinfo ()) (I64 r) 0 (handle_null ())
         else park_on rtp mine
+    else if s.op == op_nameinfo () then
+        mine = current_slot rtp
+        slot_rearm mine
+        r = getnameinfo_start (rt_loop rtp) s.p (I32 s.a) mine
+        if r != 0 then Completion (k_addrinfo ()) (I64 r) 0 (handle_null ())
+        else park_on rtp mine
     else completion_none ()
+
+/// Park on a WATCH's own slot -- a handle that goes on producing events for as long as it is
+/// open, and that nobody re-delivers for. Signals and file watchers, and nothing else.
+///
+/// It starts as `accept` does, and for `accept`'s reason: an event that arrives with nobody
+/// parked is HELD by the handle rather than dropped, so a task that steps away between two
+/// waits misses nothing. The watch was started once, when it was created; parking is all that
+/// is left to do.
+///
+/// Then it rearms the slot AT ONCE, rather than leaving that to the next await. In between, the
+/// slot holds a completion somebody has already taken, and a fill into one of those is dropped
+/// -- which for every other handle-based op is harmless, because what is dropped there is only
+/// a NOTIFICATION: an unread chunk is still in the socket, an unaccepted connection still in
+/// the backlog, an undelivered datagram still in the kernel, and libuv says so again on the
+/// next turn. A signal or an inotify event is not like that. Nobody repeats it, so the drop
+/// would be the whole event.
+///
+/// Nothing can arrive in the meantime: this still runs inside the loop callback that delivered
+/// `c`, and the next event is a later turn.
+park_on_watch (rtp: Ptr Runtime) (h: Ptr U8) (kind: I32): Completion =
+    slot = handle_slot h
+    if slot_state slot != st_done () then slot_rearm slot
+    c = park_on rtp slot
+    if c.kind == kind then slot_rearm slot
+    c
 
 /// Run `body` with `Async` satisfied by this runtime's loop. Must be called on a task's
 /// stack: parking is what satisfies a submission.
@@ -163,15 +264,38 @@ run_uv (rtp: Ptr Runtime) (body: fn Unit => a can Async): a =
 // --- blocking ------------------------------------------------------------------------------------
 
 /// Carry out one submission synchronously, with no loop and no task involved.
+///
+/// Not every operation has a synchronous twin, and the ones that do not FAIL LOUDLY here rather
+/// than quietly doing nothing: waiting for a signal needs a loop to watch for it, so under this
+/// handler it comes back ENOSYS and the caller gets an `Error` at the same place it would have
+/// got the signal. An empty completion would have been a wait that returned "nothing happened",
+/// which reads like a delivered signal with no number.
 perform_blocking (s: Submission): Completion =
     if s.op == op_sleep () then
+        // `unref` says nothing here: there is no loop for a timer to hold open.
         uv_sleep_ms s.a
         Completion (k_timer ()) 0 0 (handle_null ())
-    else if s.op == op_fs () or s.op == op_addrinfo () then
+    else if s.op == op_signal () then
+        Completion (k_signal ()) (I64 (e_nosys ())) 0 (handle_null ())
+    else if s.op == op_udp_recv () then
+        // recvfrom(2) would be the twin, and blocking a whole program in one with no deadline
+        // is not a service. A datagram socket needs the loop that is watching it.
+        Completion (k_dgram ()) (I64 (e_nosys ())) 0 (handle_null ())
+    else if s.op == op_udp_send () then
+        // sendto(2) WOULD work here -- but a program that can send and cannot receive is a
+        // half-built thing to hand somebody, and the failure would land at the receive, far
+        // from the handler that caused it. Both ends say the same thing instead.
+        Completion (k_write ()) (I64 (e_nosys ())) 0 (handle_null ())
+    else if s.op == op_watch () then
+        // Watching a path is a loop watching it. There is no synchronous twin, and a stat
+        // taken here and now would answer a different question.
+        Completion (k_fsevent ()) (I64 (e_nosys ())) 0 (handle_null ())
+    else if s.op == op_fs () or s.op == op_addrinfo () or s.op == op_nameinfo () then
         // Plain libc, with the result left in a throwaway slot so the completion has exactly
         // the shape the loop path would have produced.
         tmp = slot_new ()
         if s.op == op_fs () then ignore (fs_sync (I32 s.a) s.b s.c s.d s.p s.q tmp)
+        else if s.op == op_nameinfo () then ignore (getnameinfo_sync s.p (I32 s.a) tmp)
         else ignore (getaddrinfo_sync s.p s.q tmp)
         c = slot_completion tmp
         slot_free tmp

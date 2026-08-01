@@ -13,7 +13,9 @@ import Local.Uv.Task.Runtime
 import Local.Uv.Async.Async, blocking
 import Local.Uv.Fs.FileInfo, copy_fileinfo, fi_size, fi_is_dir,
     DirEntry, fs_mkdir, fs_rmdir, fs_unlink, fs_stat, fs_scandir_entries,
-    read_file, write_file
+    read_file, write_file,
+    FsInfo, copy_fsinfo, fst_bytes_available,
+    fs_copyfile, fs_symlink, fs_readlink, fs_realpath, fs_statfs
 import Std.Vec.Vec, len
 
 dir (): String = "/tmp/auv-fs-example"
@@ -60,6 +62,25 @@ demo (): Unit can Async =
         println ("  " ++ kind ++ "  " ++ clone e.name)
         i := i + 1usz
 
+    // The rest of the filesystem surface, briefly. Each of these is one `case` in the shim's
+    // switch and one wrapper in Fs.an, and each has a synchronous twin -- so this section runs
+    // under `blocking` exactly as the rest does.
+    copy = dir () ++ "/copy.txt"
+    link = dir () ++ "/hello.link"
+    ignore (fs_copyfile name copy 0)
+    ignore (fs_symlink name link)
+    match fs_readlink link
+    | Ok target -> println ("link points at: " ++ target)
+    | Error e -> println ("readlink failed: " ++ uv_error_text (ref e))
+    match fs_realpath copy
+    | Ok full -> println ("realpath: " ++ full)
+    | Error e -> println ("realpath failed: " ++ uv_error_text (ref e))
+    match fs_statfs (dir ())
+    | Ok fsi -> println ("filesystem: " ++ num (fst_bytes_available fsi / 1048576) ++ " MB free")
+    | Error e -> println ("statfs failed: " ++ uv_error_text (ref e))
+
+    ignore (fs_unlink link)
+    ignore (fs_unlink copy)
     ignore (fs_unlink name)
     ignore (fs_rmdir (dir ()))
     println "cleaned up"

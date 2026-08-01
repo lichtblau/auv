@@ -1,0 +1,75 @@
+// A socket on the filesystem: server and client in one process, over a path.
+//
+//     ./examples/run.sh unix-socket
+//
+// This is how anything reaches an LSP server, a docker daemon or a socket systemd handed out --
+// a name in the filesystem rather than a port on a network. It is also the shortest example of
+// what `Stream` is FOR: below the two calls that open it, nothing here knows or cares which
+// kind of socket this is. `aread`, `awrite`, `ashutdown` and `accept` are the same functions
+// the TCP examples use, on the same Stream type.
+//
+// libuv unlinks the path when the listener is closed, so no stale socket is left behind.
+
+import Local.Uv.Run.run_async, spawn_async, spawn_stream
+import Local.Uv.Uv.UvError, uv_error_text
+import Local.Uv.Task.Runtime
+import Local.Uv.Async.Async, sleep
+import Local.Uv.Stream.Stream, copy_stream, stream_free,
+    Listener, copy_listener, listener_bind_path, listener_close, listener_path, accept,
+    connect_path, AsyncRead, aread, stream_async_read,
+    AsyncWrite, awrite, stream_async_write, ashutdown, read_all
+
+// A number as decimal text. `String` on its own is the type's constructor, so the cast has to
+// be spelled out.
+num (v: I64): String = cast (I32 v)
+
+sock (): String = "/tmp/auv-unix-example.sock"
+
+// One connection: read until the peer half-closes, shout it back.
+serve_one (_rtp: Ptr Runtime) (s: Stream): Unit can Async =
+    match read_all s
+    | Error e -> println ("read failed: " ++ uv_error_text (ref e))
+    | Ok said ->
+        println ("server heard: " ++ clone said)
+        ignore (awrite s ("you said: " ++ said))
+    ignore (ashutdown s)
+    stream_free s
+
+server (rtp: Ptr Runtime) (n: I64): Unit can Async =
+    match listener_bind_path rtp (sock ()) 8
+    | Error e -> println ("bind failed: " ++ uv_error_text (ref e))
+    | Ok l ->
+        println ("listening on " ++ listener_path l)
+        var left = n
+        while left > 0 do
+            match accept rtp l
+            | Ok s ->
+                spawn_stream rtp serve_one s
+                left := left - 1
+            | Error e ->
+                println ("accept ended: " ++ uv_error_text (ref e))
+                left := 0
+        // Closing takes the socket file with it.
+        listener_close l
+
+client (rtp: Ptr Runtime) (id: I64): Unit can Async =
+    // Long enough that the listener is certainly bound first.
+    sleep 50u64
+    match connect_path rtp (sock ())
+    | Error e -> println ("client " ++ num id ++ ": " ++ uv_error_text (ref e))
+    | Ok s ->
+        ignore (awrite s ("hello from client " ++ num id))
+        ignore (ashutdown s)
+        match read_all s
+        | Ok back -> println ("client " ++ num id ++ ": " ++ back)
+        | Error e -> println ("client " ++ num id ++ ": " ++ uv_error_text (ref e))
+        stream_free s
+
+both (rtp: Ptr Runtime): Unit can Async =
+    spawn_async rtp client 1
+    spawn_async rtp client 2
+    server rtp 2
+
+main () =
+    run_async both
+    println "done"

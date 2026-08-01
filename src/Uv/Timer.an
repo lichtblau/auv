@@ -1,0 +1,124 @@
+// A repeating timer, as a resource a task can wait on over and over.
+//
+// `sleep` is one-shot: it makes a timer, waits for it, and closes it. That is the right shape
+// for "pause here", and the wrong one for "every 200 ms", because the interval then starts
+// again from whenever the task got round to asking -- so the period is the interval PLUS
+// however long the work took, and it drifts.
+//
+// A Ticker is libuv's own repeat instead. The timer is started once with a repeat and left
+// running, so it fires on a schedule that does not care how long the task spends between
+// ticks. A tick that arrives while nobody is waiting is held (one of them: see below), so a
+// task that took too long finds the next tick waiting rather than losing it.
+//
+// It COALESCES, and there is no way around that worth having: the slot holds one completion, so
+// a task that misses three ticks is told once. That is the honest answer -- what a late task
+// needs to know is that it is late, and `rt_now` says by how much. A ticker is not a way to
+// count time.
+//
+// One task per ticker at a time. Two would park on one slot, which the slot refuses outright.
+//
+// Not offered under the `blocking` handler: a repeating timer is a loop's repeating timer.
+// `sleep` is what a program with no loop has, and it is enough for one that is not competing
+// with anything.
+
+import Local.Uv.Uv.Loop, copy_loop, Slot, copy_slot, slot_new,
+    Completion, copy_completion, k_cancelled, k_closed, k_timer,
+    UvError, uv_error_of,
+    handle_null, handle_is_null, handle_adopt_slot, handle_ref, handle_unref, handle_has_ref,
+    close_handle, close_handle_waking,
+    timer_new, timer_start, timer_stop
+import Local.Uv.Task.Runtime, rt_loop
+import Local.Uv.Async.Async, submit, Submission, copy_submission, sub_op2, op_watch
+import Std.C.malloc, free
+
+export
+    Ticker, copy_ticker, ticker_every, ticker_after, ticker_is_null,
+    await_tick, ticker_stop, ticker_close, ticker_free,
+    ticker_ref, ticker_unref, ticker_has_ref
+
+// uv error codes this module returns for conditions libuv itself never reports.
+e_nomem (): I32 = -12
+e_badf (): I32 = -9
+e_cancelled (): I32 = -125
+
+// Behind a heap cell for the reason a Stream is: the wrapper is `Copy` and travels through
+// argument records, so closing through one copy has to be visible to every other copy.
+type TickerState =
+    handle: Ptr U8
+    slot: Slot
+
+type Ticker = cell: Ptr TickerState
+
+impl copy_ticker: Copy Ticker with (.*) = deref
+
+tk_of (t: Ticker): mut TickerState = ptr_to_mut t.cell
+
+/// Tick every `ms`, starting `ms` from now.
+ticker_every (rtp: Ptr Runtime) (ms: I64): Result Ticker UvError = ticker_after rtp ms ms
+
+/// The same, with the first tick at `delay_ms` and every one after it `repeat_ms` later. A
+/// delay of 0 fires on the next turn of the loop, which is how a ticker that should not wait
+/// for its own first interval is written.
+ticker_after (rtp: Ptr Runtime) (delay_ms: I64) (repeat_ms: I64): Result Ticker UvError =
+    h = timer_new (rt_loop rtp)
+    if handle_is_null h then Error (uv_error_of (e_nomem ()))
+    else
+        sl = slot_new ()
+        handle_adopt_slot h sl
+        r = timer_start h delay_ms repeat_ms
+        if r != 0 then
+            close_handle h
+            Error (uv_error_of r)
+        else
+            p: Ptr TickerState = malloc (size_of (MkType : Type TickerState))
+            ptr_store p (TickerState h sl)
+            Ok (Ticker p)
+
+ticker_is_null (t: Ticker): Bool = handle_is_null (tk_of t).handle
+
+/// Wait for the next tick. An `Error` means the wait ended some other way -- the task was
+/// cancelled, or the ticker was closed underneath it -- which is a loop's cue to return.
+await_tick (t: Ticker): Result Unit UvError can Async =
+    h = (tk_of t).handle
+    if handle_is_null h then Error (uv_error_of (e_badf ()))
+    else
+        c = submit (sub_op2 (op_watch ()) (I64 (k_timer ())) h)
+        if c.kind == k_cancelled () then Error (uv_error_of (e_cancelled ()))
+        else if c.kind == k_closed () then Error (uv_error_of (e_badf ()))
+        else if c.kind != k_timer () then Error (uv_error_of (I32 c.status))
+        else Ok ()
+
+/// Stop ticking without releasing the ticker. `ticker_after` on the same runtime is how it
+/// starts again -- this one is for a program that wants the pause, not the reallocation.
+ticker_stop (t: Ticker): Unit =
+    h = (tk_of t).handle
+    if not (handle_is_null h) then ignore (timer_stop h)
+
+/// Stop and release, waking anyone parked on it first. Idempotent, and every copy of the
+/// wrapper sees it.
+ticker_close (t: Ticker): Unit =
+    st = tk_of t
+    if not (handle_is_null st.handle) then
+        h = st.handle
+        st.handle := handle_null ()
+        st.slot := Slot (handle_null ())
+        ignore (timer_stop h)
+        close_handle_waking h (k_closed ()) 0
+
+/// Same as `ticker_close`: the handle owns everything underneath.
+ticker_free (t: Ticker): Unit = ticker_close t
+
+/// Keep ticking without keeping the loop alive -- what a heartbeat wants, and the difference
+/// between a program that finishes and one that does not.
+ticker_unref (t: Ticker): Unit =
+    h = (tk_of t).handle
+    if not (handle_is_null h) then handle_unref h
+
+/// Count this ticker again, undoing `ticker_unref`.
+ticker_ref (t: Ticker): Unit =
+    h = (tk_of t).handle
+    if not (handle_is_null h) then handle_ref h
+
+ticker_has_ref (t: Ticker): Bool =
+    h = (tk_of t).handle
+    not (handle_is_null h) and handle_has_ref h

@@ -1,0 +1,258 @@
+// Datagrams over the Async effect.
+//
+// A datagram socket is not a stream and is not a listener: there is no connection, so every
+// arrival carries its own sender and every send names its destination. What it DOES share with
+// a stream is the shape of the wait -- `udp_recv` parks on the socket's own slot exactly as
+// `aread` parks on a stream's, and for the same reason: a datagram that arrives with nobody
+// waiting is held rather than delivered to whatever the owning task went on to do.
+//
+// Backpressure is parking here too, and it matters more than it does for a stream. The shim
+// stops receiving the moment a datagram arrives with no reader parked, which leaves the next
+// one in the KERNEL's buffer. A socket that is read only occasionally therefore drops under the
+// kernel's rule -- a bounded queue, reported by the OS -- rather than silently in a wait slot.
+//
+// One task per socket at a time. Two would park on one slot, which the slot refuses outright.
+//
+// Neither operation is offered under the `blocking` handler. recvfrom(2) with no deadline is
+// exactly the freeze parking exists to remove, so both ends report ENOSYS instead; see the note
+// on `perform_blocking`.
+
+import Local.Uv.Uv.Loop, copy_loop, Slot, copy_slot, slot_new,
+    Completion, copy_completion, k_cancelled, k_closed,
+    UvError, uv_check, uv_error_of,
+    handle_null, handle_is_null, handle_adopt_slot, handle_ref, handle_unref, handle_has_ref,
+    close_handle, close_handle_waking,
+    udp_new, udp_bind, udp_port, udp_try_send, udp_connect, udp_addr, udp_peer_addr,
+    udp_peer_port, udp_set_broadcast, udp_set_ttl, udp_set_multicast_loop,
+    udp_set_multicast_ttl, udp_membership,
+    dgram_header, dgram_ip_len, dgram_port,
+    buf_string_at, buf_free, cstr_of_string, as_i64, as_usz
+import Local.Uv.Task.Runtime, rt_loop
+import Local.Uv.Async.Async, submit, Submission, copy_submission, sub_op2, sub_udp_send,
+    op_udp_recv, op_udp_send
+import Std.C.malloc, free
+
+export
+    Udp, copy_udp, udp_socket, udp_local_port, udp_is_null, udp_close, udp_free,
+    udp_recv, udp_send, udp_ref, udp_unref, udp_has_ref,
+    udp_try_send_to, udp_connect_to, udp_disconnect, udp_send_to_peer,
+    udp_local_addr, udp_peer, udp_peer_at,
+    udp_broadcast, udp_ttl, udp_multicast_loop, udp_multicast_ttl,
+    udp_join_group, udp_leave_group,
+    Datagram, dg_from, dg_port, dg_data
+
+// uv error codes this module returns for conditions libuv itself never reports.
+e_nomem (): I32 = -12
+e_badf (): I32 = -9
+e_cancelled (): I32 = -125
+
+// --- a datagram ---------------------------------------------------------------------------------
+
+/// One received datagram: who sent it, from which port, and what they said.
+///
+/// Not `Copy`, because two of its three fields are Strings -- the same reason `DirEntry` is not.
+type Datagram =
+    from: String
+    port: I32
+    data: String
+
+dg_from (d: ref Datagram): String = clone d.from
+dg_port (d: ref Datagram): I32 = d.port
+dg_data (d: ref Datagram): String = clone d.data
+
+// --- a socket -----------------------------------------------------------------------------------
+
+// Behind a heap cell for the reason a Stream is: the wrapper is `Copy` and travels through
+// argument records, so closing through one copy has to be visible to every other copy.
+type UdpState =
+    handle: Ptr U8
+    slot: Slot
+
+type Udp = cell: Ptr UdpState
+
+impl copy_udp: Copy Udp with (.*) = deref
+
+ud_of (u: Udp): mut UdpState = ptr_to_mut u.cell
+
+/// Open a datagram socket bound to a numeric address, IPv4 or IPv6. Port 0 asks the kernel to
+/// choose one, which `udp_local_port` then reports -- how a client learns where replies will
+/// come back to.
+udp_socket (rtp: Ptr Runtime) (ip: ref String) (port: I32): Result Udp UvError =
+    h = udp_new (rt_loop rtp)
+    if handle_is_null h then Error (uv_error_of (e_nomem ()))
+    else
+        r = udp_bind h ip port
+        if r != 0 then
+            close_handle h
+            Error (uv_error_of r)
+        else
+            sl = slot_new ()
+            handle_adopt_slot h sl
+            p: Ptr UdpState = malloc (size_of (MkType : Type UdpState))
+            ptr_store p (UdpState h sl)
+            Ok (Udp p)
+
+/// The port this socket is actually bound to, or -1.
+udp_local_port (u: Udp): I32 =
+    h = (ud_of u).handle
+    if handle_is_null h then -1 else udp_port h
+
+udp_is_null (u: Udp): Bool = handle_is_null (ud_of u).handle
+
+/// Wait for the next datagram.
+///
+/// An empty datagram is a real one and comes back with `data` empty; there is no end of file
+/// for a socket that has no connection to end.
+udp_recv (u: Udp): Result Datagram UvError can Async =
+    h = (ud_of u).handle
+    if handle_is_null h then Error (uv_error_of (e_badf ()))
+    else
+        c = submit (sub_op2 (op_udp_recv ()) 0 h)
+        if c.kind == k_cancelled () then Error (uv_error_of (e_cancelled ()))
+        else if c.kind == k_closed () then Error (uv_error_of (e_badf ()))
+        else if c.status < 0 then Error (uv_error_of (I32 c.status))
+        else
+            // One payload holding both the sender and the bytes -- see the layout note in
+            // Uv.an. The length of the datagram itself is the completion's `aux`.
+            iplen = dgram_ip_len c.payload
+            from = buf_string_at c.payload (dgram_header ()) iplen
+            port = dgram_port c.payload
+            data = buf_string_at c.payload (dgram_header () + iplen) (as_usz c.aux)
+            buf_free c.payload
+            Ok (Datagram from port data)
+
+/// Send one datagram to a numeric address and port. It is sent whole or not at all, and
+/// arriving is nobody's promise -- that is what datagrams are.
+udp_send (u: Udp) (bytes: ref String) (ip: ref String) (port: I32): Result Unit UvError can Async =
+    h = (ud_of u).handle
+    if handle_is_null h then Error (uv_error_of (e_badf ()))
+    else
+        addr = cstr_of_string ip
+        c = submit (sub_udp_send h (transmute bytes.data) (as_i64 (U64 bytes.length)) addr port)
+        buf_free addr
+        if c.kind == k_cancelled () then Error (uv_error_of (e_cancelled ()))
+        else uv_check c.status
+
+/// Send now or not at all: no request, no park, and an `Error` (EAGAIN) rather than a queue
+/// when the kernel will not take it this instant. What a program uses when dropping the
+/// datagram is better than waiting to send it -- a metric, a discovery beacon -- and the only
+/// send that can be called from somewhere that cannot park.
+udp_try_send_to (u: Udp) (bytes: ref String) (ip: ref String) (port: I32): Result Unit UvError =
+    h = (ud_of u).handle
+    if handle_is_null h then Error (uv_error_of (e_badf ()))
+    else
+        addr = cstr_of_string ip
+        n = udp_try_send h (transmute bytes.data) (Usz bytes.length) addr port
+        buf_free addr
+        uv_check n
+
+/// Fix a peer. Sends need no address afterwards -- that is what `udp_send_to_peer` is for --
+/// and the kernel drops datagrams from anyone else, which is the cheapest filter there is.
+/// Connecting says nothing to the peer and can fail only locally: there is no handshake.
+udp_connect_to (u: Udp) (ip: ref String) (port: I32): Result Unit UvError =
+    h = (ud_of u).handle
+    if handle_is_null h then Error (uv_error_of (e_badf ()))
+    else uv_check (I64 (udp_connect h ip port))
+
+/// Undo it, and take datagrams from anyone again.
+udp_disconnect (u: Udp): Result Unit UvError =
+    h = (ud_of u).handle
+    if handle_is_null h then Error (uv_error_of (e_badf ()))
+    else uv_check (I64 (udp_connect h "" 0))
+
+/// Send to the fixed peer of a connected socket. Passing an address to one of those is an
+/// error, which is why this is a separate call rather than an empty argument.
+udp_send_to_peer (u: Udp) (bytes: ref String): Result Unit UvError can Async =
+    h = (ud_of u).handle
+    if handle_is_null h then Error (uv_error_of (e_badf ()))
+    else
+        c = submit (sub_udp_send h (transmute bytes.data) (as_i64 (U64 bytes.length))
+                                 (handle_null ()) 0)
+        if c.kind == k_cancelled () then Error (uv_error_of (e_cancelled ()))
+        else uv_check c.status
+
+/// Where this socket is bound, and where it is connected. Empty and -1 for an unconnected one.
+udp_local_addr (u: Udp): String =
+    h = (ud_of u).handle
+    if handle_is_null h then "" else udp_addr h
+
+udp_peer (u: Udp): String =
+    h = (ud_of u).handle
+    if handle_is_null h then "" else udp_peer_addr h
+
+udp_peer_at (u: Udp): I32 =
+    h = (ud_of u).handle
+    if handle_is_null h then -1 else udp_peer_port h
+
+// --- the knobs ------------------------------------------------------------------------------------
+
+// Set on the socket rather than passed per datagram, because that is what they are: kernel
+// state for this socket, not part of any one send.
+
+// Each one is the same three lines rather than a shared helper taking the setter: a closure
+// that captures its argument is not a free function, and this compiler says so -- the same wall
+// `Run.an` describes, met here at its smallest.
+
+/// Allow sending to a broadcast address. Off by default, and the kernel refuses until it is on.
+udp_broadcast (u: Udp) (on: Bool): Result Unit UvError =
+    h = (ud_of u).handle
+    if handle_is_null h then Error (uv_error_of (e_badf ()))
+    else uv_check (I64 (udp_set_broadcast h on))
+
+/// How many hops a datagram may take. 1 keeps it on the local network.
+udp_ttl (u: Udp) (ttl: I32): Result Unit UvError =
+    h = (ud_of u).handle
+    if handle_is_null h then Error (uv_error_of (e_badf ()))
+    else uv_check (I64 (udp_set_ttl h ttl))
+
+/// Whether a datagram sent to a group also comes back to this host. On by default, and off is
+/// what a program that would otherwise hear its own announcements wants.
+udp_multicast_loop (u: Udp) (on: Bool): Result Unit UvError =
+    h = (ud_of u).handle
+    if handle_is_null h then Error (uv_error_of (e_badf ()))
+    else uv_check (I64 (udp_set_multicast_loop h on))
+
+/// How far a multicast datagram travels. 1 -- the default -- keeps it on the local network.
+udp_multicast_ttl (u: Udp) (ttl: I32): Result Unit UvError =
+    h = (ud_of u).handle
+    if handle_is_null h then Error (uv_error_of (e_badf ()))
+    else uv_check (I64 (udp_set_multicast_ttl h ttl))
+
+/// Start receiving datagrams sent to a multicast group. An empty `iface` means "whichever
+/// interface the routing table picks", which is what a machine with one network wants.
+udp_join_group (u: Udp) (group: ref String) (iface: ref String): Result Unit UvError =
+    h = (ud_of u).handle
+    if handle_is_null h then Error (uv_error_of (e_badf ()))
+    else uv_check (I64 (udp_membership h group iface true))
+
+udp_leave_group (u: Udp) (group: ref String) (iface: ref String): Result Unit UvError =
+    h = (ud_of u).handle
+    if handle_is_null h then Error (uv_error_of (e_badf ()))
+    else uv_check (I64 (udp_membership h group iface false))
+
+/// Close the socket, waking anyone parked on it first. Idempotent, and every copy of the
+/// wrapper sees it.
+udp_close (u: Udp): Unit =
+    st = ud_of u
+    if not (handle_is_null st.handle) then
+        h = st.handle
+        st.handle := handle_null ()
+        st.slot := Slot (handle_null ())
+        close_handle_waking h (k_closed ()) 0
+
+/// Same as `udp_close`: the handle owns everything underneath.
+udp_free (u: Udp): Unit = udp_close u
+
+/// Keep receiving without keeping the loop alive.
+udp_unref (u: Udp): Unit =
+    h = (ud_of u).handle
+    if not (handle_is_null h) then handle_unref h
+
+/// Count this socket again, undoing `udp_unref`.
+udp_ref (u: Udp): Unit =
+    h = (ud_of u).handle
+    if not (handle_is_null h) then handle_ref h
+
+udp_has_ref (u: Udp): Bool =
+    h = (ud_of u).handle
+    not (handle_is_null h) and handle_has_ref h

@@ -5,25 +5,41 @@
 // what makes it safe for a filesystem result to resume a coroutine at all.
 //
 // Results that are more than a number are marshalled into the wait slot's payload: a read
-// buffer as it stands, a stat as four packed integers, a directory or an address list as
-// newline-separated text. Nothing here needs Ante and C to agree on a struct layout.
+// buffer as it stands, a stat as four packed integers, a link target or a resolved path as
+// bytes, a directory or an address list as newline-separated text. Nothing here needs Ante and
+// C to agree on a struct layout.
+//
+// Every operation has a synchronous twin, so all of this works under `blocking` too. Two of
+// them are not quite the same call underneath and say so where they are defined: `fs_copyfile`
+// (there is no libc copyfile, so the blocking path is the read/write loop it stands for) and
+// `fs_statfs` (statvfs(3) is the portable one and does not carry the filesystem type).
 
 import Local.Uv.Uv.Completion, copy_completion, k_fs, k_addrinfo, k_cancelled,
     UvError, uv_check, uv_error_of,
     handle_null, handle_is_null, buf_free, buf_string, cstr_of_string, as_i64, as_usz
 import Local.Uv.Async.Async, submit, Submission, copy_submission, op_fs, op_addrinfo,
-    sub_fs, sub_addrinfo
+    op_nameinfo, sub_fs, sub_addrinfo, sub_nameinfo
 import Std.Vec.Vec, empty, push, len
 
 
 export
-    FileInfo, copy_fileinfo, fi_size, fi_is_dir, fi_mode, fi_mtime,
+    FileInfo, copy_fileinfo, fi_size, fi_is_dir, fi_mode, fi_mtime, file_info_of,
+    FsInfo, copy_fsinfo, fst_type, fst_block_size, fst_blocks, fst_blocks_free,
+    fst_blocks_available, fst_files, fst_files_free, fst_bytes_available,
     o_rdonly, o_wronly, o_rdwr, o_creat, o_trunc, o_append, o_excl,
+    f_ok, r_ok, w_ok, x_ok, copyfile_excl, copyfile_ficlone,
     fso_open, fso_read, fso_write, fso_close, fso_stat, fso_scandir,
     fso_mkdir, fso_unlink, fso_rename, fso_rmdir,
+    fso_fsync, fso_fdatasync, fso_ftruncate, fso_lstat, fso_fstat, fso_access, fso_chmod,
+    fso_chown, fso_utime, fso_link, fso_symlink, fso_readlink, fso_realpath, fso_copyfile,
+    fso_mkdtemp, fso_statfs,
     DirEntry, fs_open, fs_read, fs_write, fs_close, fs_stat, fs_scandir, fs_scandir_entries,
     fs_mkdir, fs_rmdir, fs_unlink, fs_rename,
-    read_file, write_file, resolve
+    fs_fsync, fs_fdatasync, fs_ftruncate, fs_lstat, fs_fstat, fs_access, fs_exists, fs_chmod,
+    fs_chown, fs_utime, fs_link, fs_symlink, fs_readlink, fs_realpath, fs_copyfile,
+    fs_mkdtemp, fs_statfs,
+    read_file, write_file, resolve,
+    NameInfo, ni_host, ni_service, reverse_lookup
 
 // --- the operations, as the shim numbers them ------------------------------------------------
 // Exported, because this is the numbering and there should be exactly one copy of it: a caller
@@ -39,6 +55,22 @@ fso_mkdir (): I64 = 7
 fso_unlink (): I64 = 8
 fso_rename (): I64 = 9
 fso_rmdir (): I64 = 10
+fso_fsync (): I64 = 11
+fso_fdatasync (): I64 = 12
+fso_ftruncate (): I64 = 13
+fso_lstat (): I64 = 14
+fso_fstat (): I64 = 15
+fso_access (): I64 = 16
+fso_chmod (): I64 = 17
+fso_chown (): I64 = 18
+fso_utime (): I64 = 19
+fso_link (): I64 = 20
+fso_symlink (): I64 = 21
+fso_readlink (): I64 = 22
+fso_realpath (): I64 = 23
+fso_copyfile (): I64 = 24
+fso_mkdtemp (): I64 = 25
+fso_statfs (): I64 = 26
 
 // Open flags, read from the shim because their values are platform-specific.
 auv_o_rdonly = extern "auv_o_rdonly": fn Unit -> I32
@@ -49,7 +81,16 @@ auv_o_trunc  = extern "auv_o_trunc":  fn Unit -> I32
 auv_o_append = extern "auv_o_append": fn Unit -> I32
 auv_o_excl   = extern "auv_o_excl":   fn Unit -> I32
 
-auv_stat_field = extern "auv_stat_field": fn (Ptr U8) Usz -> I64
+// access(2) modes and copyfile flags, for the same reason.
+auv_f_ok = extern "auv_f_ok": fn Unit -> I32
+auv_r_ok = extern "auv_r_ok": fn Unit -> I32
+auv_w_ok = extern "auv_w_ok": fn Unit -> I32
+auv_x_ok = extern "auv_x_ok": fn Unit -> I32
+auv_copyfile_excl    = extern "auv_copyfile_excl":    fn Unit -> I32
+auv_copyfile_ficlone = extern "auv_copyfile_ficlone": fn Unit -> I32
+
+auv_stat_field   = extern "auv_stat_field":   fn (Ptr U8) Usz -> I64
+auv_statfs_field = extern "auv_statfs_field": fn (Ptr U8) Usz -> I64
 
 o_rdonly (): I64 = I64 (auv_o_rdonly ())
 o_wronly (): I64 = I64 (auv_o_wronly ())
@@ -58,6 +99,19 @@ o_creat (): I64 = I64 (auv_o_creat ())
 o_trunc (): I64 = I64 (auv_o_trunc ())
 o_append (): I64 = I64 (auv_o_append ())
 o_excl (): I64 = I64 (auv_o_excl ())
+
+/// Does it exist at all -- the mode `fs_access` takes to ask nothing more.
+f_ok (): I64 = I64 (auv_f_ok ())
+r_ok (): I64 = I64 (auv_r_ok ())
+w_ok (): I64 = I64 (auv_w_ok ())
+x_ok (): I64 = I64 (auv_x_ok ())
+
+/// Fail rather than overwrite an existing destination.
+copyfile_excl (): I64 = I64 (auv_copyfile_excl ())
+
+/// Ask the filesystem for a copy-on-write clone, falling back to a real copy where it cannot.
+/// Not honored by the `blocking` handler, which always copies the bytes.
+copyfile_ficlone (): I64 = I64 (auv_copyfile_ficlone ())
 
 // --- results --------------------------------------------------------------------------------
 
@@ -73,6 +127,40 @@ fi_size (f: FileInfo): I64 = f.size
 fi_mode (f: FileInfo): I64 = f.mode
 fi_is_dir (f: FileInfo): Bool = f.is_dir
 fi_mtime (f: FileInfo): I64 = f.mtime
+
+/// What a filesystem says about itself. `fst_type` is the one field the `blocking` handler
+/// cannot fill -- statvfs(3) is portable and does not carry it -- so it is 0 there and the real
+/// magic number on the loop path.
+type FsInfo =
+    fs_type: I64
+    block_size: I64
+    blocks: I64
+    blocks_free: I64
+    blocks_available: I64
+    files: I64
+    files_free: I64
+
+impl copy_fsinfo: Copy FsInfo with (.*) = deref
+
+fst_type (f: FsInfo): I64 = f.fs_type
+fst_block_size (f: FsInfo): I64 = f.block_size
+fst_blocks (f: FsInfo): I64 = f.blocks
+fst_blocks_free (f: FsInfo): I64 = f.blocks_free
+fst_blocks_available (f: FsInfo): I64 = f.blocks_available
+fst_files (f: FsInfo): I64 = f.files
+fst_files_free (f: FsInfo): I64 = f.files_free
+
+/// Bytes a filesystem has left for an ordinary user.
+fst_bytes_available (f: FsInfo): I64 = f.block_size * f.blocks_available
+
+/// A FileInfo out of a marshalled stat payload.
+///
+/// Exported because a stat does not only arrive from a filesystem submission: a poll watch
+/// reports one on every change, and it is packed by the same shim function. This is the one
+/// place that knows the field order.
+file_info_of (payload: Ptr U8): FileInfo =
+    FileInfo (auv_stat_field payload 0usz) (auv_stat_field payload 1usz)
+             (auv_stat_field payload 2usz != 0) (auv_stat_field payload 3usz)
 
 // A completion whose status is negative is an error; cancellation is ECANCELED.
 fs_status (c: Completion): Result I64 UvError =
@@ -122,8 +210,7 @@ fs_stat (path: ref String): Result FileInfo UvError can Async =
     match fs_status c
     | Error e -> Error e
     | Ok _n ->
-        info = FileInfo (auv_stat_field c.payload 0usz) (auv_stat_field c.payload 1usz)
-                        (auv_stat_field c.payload 2usz != 0) (auv_stat_field c.payload 3usz)
+        info = file_info_of c.payload
         buf_free c.payload
         Ok info
 
@@ -200,6 +287,147 @@ fs_rename (from: ref String) (to: ref String): Result Unit UvError can Async =
     | Ok _n -> Ok ()
     | Error e -> Error e
 
+// --- the second batch --------------------------------------------------------------------------
+// Everything below is the same three lines: build the submission, hand the completion to
+// `fs_status`, shape the result. The variety is in what each one's arguments MEAN, which is
+// what the signatures are for.
+
+// A submission whose answer is only "did it work".
+fs_unit (sub: I64) (a: I64) (b: I64) (p: Ptr U8) (q: Ptr U8): Result Unit UvError can Async =
+    c = submit (sub_fs sub a b 0 p q)
+    match fs_status c
+    | Ok _n -> Ok ()
+    | Error e -> Error e
+
+// The same over one path.
+fs_unit_path (sub: I64) (a: I64) (b: I64) (path: ref String): Result Unit UvError can Async =
+    p = cstr_of_string path
+    r = fs_unit sub a b p (handle_null ())
+    buf_free p
+    r
+
+// A submission whose answer is a string in the payload: a link target, a resolved path.
+fs_text (sub: I64) (path: ref String): Result String UvError can Async =
+    p = cstr_of_string path
+    c = submit (sub_fs sub 0 0 0 p (handle_null ()))
+    buf_free p
+    match fs_status c
+    | Error e -> Error e
+    | Ok _n ->
+        text = buf_string c.payload (as_usz c.aux)
+        buf_free c.payload
+        Ok text
+
+// A submission whose answer is a stat.
+fs_info (sub: I64) (a: I64) (p: Ptr U8): Result FileInfo UvError can Async =
+    c = submit (sub_fs sub a 0 0 p (handle_null ()))
+    match fs_status c
+    | Error e -> Error e
+    | Ok _n ->
+        info = file_info_of c.payload
+        buf_free c.payload
+        Ok info
+
+/// Flush a file's contents AND its metadata to the device.
+fs_fsync (fd: I32): Result Unit UvError can Async =
+    fs_unit (fso_fsync ()) (I64 fd) 0 (handle_null ()) (handle_null ())
+
+/// Flush a file's contents only, which is the cheaper half of `fs_fsync`.
+fs_fdatasync (fd: I32): Result Unit UvError can Async =
+    fs_unit (fso_fdatasync ()) (I64 fd) 0 (handle_null ()) (handle_null ())
+
+/// Cut a file to `len` bytes, or extend it with zeroes.
+fs_ftruncate (fd: I32) (len: I64): Result Unit UvError can Async =
+    fs_unit (fso_ftruncate ()) (I64 fd) len (handle_null ()) (handle_null ())
+
+/// Stat WITHOUT following a symbolic link: the link itself, not what it points at.
+fs_lstat (path: ref String): Result FileInfo UvError can Async =
+    p = cstr_of_string path
+    r = fs_info (fso_lstat ()) 0 p
+    buf_free p
+    r
+
+/// Stat an open descriptor.
+fs_fstat (fd: I32): Result FileInfo UvError can Async =
+    fs_info (fso_fstat ()) (I64 fd) (handle_null ())
+
+/// Ask whether a path is reachable in a given way: `f_ok` for existence, or `r_ok`/`w_ok`/
+/// `x_ok`, added together. An `Error` is the answer "no", not a malfunction.
+fs_access (path: ref String) (mode: I64): Result Unit UvError can Async =
+    fs_unit_path (fso_access ()) mode 0 path
+
+/// Does this path exist? `fs_access` with the question narrowed and the answer flattened.
+fs_exists (path: ref String): Bool can Async =
+    match fs_access path (f_ok ())
+    | Ok _u -> true
+    | Error _e -> false
+
+fs_chmod (path: ref String) (mode: I64): Result Unit UvError can Async =
+    fs_unit_path (fso_chmod ()) mode 0 path
+
+fs_chown (path: ref String) (uid: I64) (gid: I64): Result Unit UvError can Async =
+    fs_unit_path (fso_chown ()) uid gid path
+
+/// Set the access and modification times, in whole seconds since the epoch. libuv's own call
+/// takes fractional seconds; the submission carries integers, so this is the whole of it.
+fs_utime (path: ref String) (atime: I64) (mtime: I64): Result Unit UvError can Async =
+    fs_unit_path (fso_utime ()) atime mtime path
+
+/// A second name for the same file. Both names are equal afterwards; there is no original.
+fs_link (target: ref String) (link_path: ref String): Result Unit UvError can Async =
+    a = cstr_of_string target
+    b = cstr_of_string link_path
+    r = fs_unit (fso_link ()) 0 0 a b
+    buf_free a
+    buf_free b
+    r
+
+/// A symbolic link at `link_path` pointing at `target`. `target` is stored as given and is not
+/// checked, so a link to something that does not exist yet is allowed.
+fs_symlink (target: ref String) (link_path: ref String): Result Unit UvError can Async =
+    a = cstr_of_string target
+    b = cstr_of_string link_path
+    r = fs_unit (fso_symlink ()) 0 0 a b
+    buf_free a
+    buf_free b
+    r
+
+/// What a symbolic link points at, exactly as it was written: one step, no resolution.
+fs_readlink (path: ref String): Result String UvError can Async = fs_text (fso_readlink ()) path
+
+/// The canonical absolute path: every link followed, every "." and ".." resolved. Fails if any
+/// part of the path does not exist.
+fs_realpath (path: ref String): Result String UvError can Async = fs_text (fso_realpath ()) path
+
+/// Copy a file, with the destination's permissions taken from the source. `flags` is 0, or
+/// `copyfile_excl` and `copyfile_ficlone` added together.
+fs_copyfile (from: ref String) (to: ref String) (flags: I64): Result Unit UvError can Async =
+    a = cstr_of_string from
+    b = cstr_of_string to
+    r = fs_unit (fso_copyfile ()) flags 0 a b
+    buf_free a
+    buf_free b
+    r
+
+/// Create a directory nobody else can have, from a template whose LAST SIX characters must be
+/// "XXXXXX", and return the name it actually got.
+fs_mkdtemp (template: ref String): Result String UvError can Async = fs_text (fso_mkdtemp ()) template
+
+/// The numbers of the filesystem a path lives on.
+fs_statfs (path: ref String): Result FsInfo UvError can Async =
+    p = cstr_of_string path
+    c = submit (sub_fs (fso_statfs ()) 0 0 0 p (handle_null ()))
+    buf_free p
+    match fs_status c
+    | Error e -> Error e
+    | Ok _n ->
+        info = FsInfo (auv_statfs_field c.payload 0usz) (auv_statfs_field c.payload 1usz)
+                      (auv_statfs_field c.payload 2usz) (auv_statfs_field c.payload 3usz)
+                      (auv_statfs_field c.payload 4usz) (auv_statfs_field c.payload 5usz)
+                      (auv_statfs_field c.payload 6usz)
+        buf_free c.payload
+        Ok info
+
 // --- convenience ---------------------------------------------------------------------------------
 
 read_chunk (): Usz = 65536usz
@@ -257,7 +485,38 @@ resolve (host: ref String) (service: ref String): Result (Vec String) UvError ca
         buf_free c.payload
         Ok (lines_of text)
 
+/// The other direction: an address back to a name, and a port back to a service.
+///
+/// The answer is the resolver's, which is to say it is whatever the reverse zone says and
+/// nobody is obliged to keep that honest -- a name from here is a hint, not an identity. A
+/// port with no service name comes back as its number.
+reverse_lookup (ip: ref String) (port: I32): Result NameInfo UvError can Async =
+    p = cstr_of_string ip
+    c = submit (sub_nameinfo p port)
+    buf_free p
+    if c.kind == k_cancelled () then Error (uv_error_of -125)
+    else if c.status < 0 then Error (uv_error_of (I32 c.status))
+    else
+        text = buf_string c.payload (as_usz c.aux)
+        buf_free c.payload
+        parts = lines_of text
+        Ok (NameInfo (line_at (ref parts) 0usz) (line_at (ref parts) 1usz))
+
+// One line of a marshalled list, cloned out of it, or "" past the end.
+line_at (v: ref Vec String) (i: Usz): String =
+    if i >= v.len then "" else clone (ptr_to_mut (offset v.data i))
+
 // --- shared -----------------------------------------------------------------------------------------
+
+/// What an address resolved back to: a host name and a service name.
+///
+/// Not `Copy`, because it holds two Strings -- the same reason `DirEntry` is not.
+type NameInfo =
+    host: String
+    service: String
+
+ni_host (n: ref NameInfo): String = clone n.host
+ni_service (n: ref NameInfo): String = clone n.service
 
 /// One directory entry: its name, and whether the filesystem said it is a directory.
 ///

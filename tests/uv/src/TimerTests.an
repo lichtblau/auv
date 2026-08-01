@@ -1,0 +1,182 @@
+// Repeating-timer suite: a ticker as something a task waits on over and over.
+//
+// The one thing worth proving here that `sleep` cannot claim: the schedule does not drift when
+// the task between ticks is slow. Nothing asserts a wall-clock duration -- the interval and the
+// work are separated by enough that only the ORDER matters.
+
+import Local.Harness.TestState, ok, is_i32, is_i64, is_usz
+import Local.Uv.Uv.UvError, uv_error_text, handle_is_null, loop_alive, loop_thread_faults, as_i64
+import Local.Uv.Task.Runtime, rt_new, rt_free, rt_loop, rt_now, rt_update_time,
+    rt_backend_fd, rt_backend_timeout, rt_live_count, rt_task_count,
+    spawn_default, run, shutdown, sleep_ms
+import Local.Uv.Async.Async, run_uv, blocking, sleep
+import Local.Uv.Timer.Ticker, copy_ticker, ticker_every, ticker_after, await_tick,
+    ticker_stop, ticker_close, ticker_ref, ticker_unref, ticker_has_ref
+import Std.Vec.Vec, empty, push, len
+import Std.C.malloc, free
+
+export run_timer_tests
+
+// --- shared shapes ---------------------------------------------------------------------------
+
+type Arg =
+    rt: Ptr Runtime
+    log: Ptr (Vec I64)
+    a: I64
+    b: I64
+
+impl copy_targ: Copy Arg with (.*) = deref
+
+arg_of (p: Ptr U8): Arg = deref_ptr (transmute p : Ptr Arg)
+
+log_push (a: Arg) (v: I64): Unit =
+    lg = ptr_to_mut a.log
+    lg.push v
+
+new_log (): Ptr (Vec I64) =
+    p: Ptr (Vec I64) = malloc (size_of (MkType : Type (Vec I64)))
+    ptr_store p (Vec.empty ())
+    p
+
+log_at (p: Ptr (Vec I64)) (i: Usz): I64 =
+    lg = ptr_to_mut p
+    if i >= lg.len then -1 else deref_ptr (offset lg.data i)
+
+log_len (p: Ptr (Vec I64)): Usz = (ptr_to_mut p).len
+
+free_log (p: Ptr (Vec I64)): Unit =
+    lg = ptr_to_mut p
+    if not (handle_is_null (transmute lg.data)) then free (transmute lg.data)
+    free (transmute p)
+
+new_args (n: Usz): Ptr Arg = malloc (n * size_of (MkType : Type Arg))
+arg_slot (base: Ptr Arg) (i: Usz): Ptr Arg = offset base i
+
+// --- ticking -----------------------------------------------------------------------------------
+
+// Take `a` ticks and stop. Each one is logged with the loop's own clock, so the test can check
+// the SCHEDULE rather than the count.
+ticker_task (p: Ptr U8): Unit =
+    arg = arg_of p
+    run_uv arg.rt fn () ->
+        match ticker_every arg.rt 40
+        | Error _e -> log_push arg -1
+        | Ok tk ->
+            started = rt_now arg.rt
+            var left = arg.a
+            while left > 0 do
+                match await_tick tk
+                | Error _e -> left := 0
+                | Ok _u ->
+                    log_push arg (rt_now arg.rt - started)
+                    left := left - 1
+            ticker_close tk
+
+test_ticker (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    args = new_args 1usz
+    ptr_store (arg_slot args 0usz) (Arg rtp lg 3 0)
+    ignore (spawn_default rtp (transmute (ticker_task : fn (Ptr U8) -> Unit))
+                              (transmute (arg_slot args 0usz)))
+    run rtp
+
+    t.is_usz "ticker: it ticked three times" (log_len lg) 3usz
+    // Coarse and one-sided: each tick is later than the one before it, and the third is at
+    // least two intervals in. Nothing here asserts how long anything took.
+    t.ok "ticker: the ticks are in order"
+         (log_at lg 0usz <= log_at lg 1usz and log_at lg 1usz <= log_at lg 2usz)
+    t.ok "ticker: and spread over more than one interval" (log_at lg 2usz >= 80)
+    t.is_i64 "ticker: no completion off the loop thread" (loop_thread_faults (rt_loop rtp)) 0
+
+    shutdown rtp
+    rt_free rtp
+    free_log lg
+    free (transmute args)
+
+// --- a slow task does not shift the schedule ----------------------------------------------------
+
+// Tick every 40 ms and spend 100 ms on the first one. A `sleep`-based loop would start its next
+// interval AFTER the work, so the second tick would land at 140 ms and everything after it
+// would slide. libuv's own repeat does not: the timer kept firing while the task was busy, so
+// the tick that was waiting is delivered at once and the schedule is where it always was.
+slow_ticker_task (p: Ptr U8): Unit =
+    arg = arg_of p
+    run_uv arg.rt fn () ->
+        match ticker_every arg.rt 40
+        | Error _e -> log_push arg -1
+        | Ok tk ->
+            started = rt_now arg.rt
+            match await_tick tk
+            | Error _e -> log_push arg -2
+            | Ok _u -> sleep 100u64
+            match await_tick tk
+            | Error _e -> log_push arg -3
+            | Ok _u -> log_push arg (rt_now arg.rt - started)
+            ticker_close tk
+
+test_ticker_no_drift (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    args = new_args 1usz
+    ptr_store (arg_slot args 0usz) (Arg rtp lg 0 0)
+    ignore (spawn_default rtp (transmute (slow_ticker_task : fn (Ptr U8) -> Unit))
+                              (transmute (arg_slot args 0usz)))
+    run rtp
+
+    t.is_usz "ticker_no_drift: the second tick arrived" (log_len lg) 1usz
+    // The work ended around 140 ms in; a tick that had been waiting since 80 is delivered
+    // immediately, so this lands well before the 180 a restarted interval would have given.
+    t.ok "ticker_no_drift: it was waiting rather than restarted" (log_at lg 0usz < 175)
+
+    shutdown rtp
+    rt_free rtp
+    free_log lg
+    free (transmute args)
+
+// --- a ticker that does not keep the loop alive --------------------------------------------------
+
+test_ticker_unref (t: mut TestState): Unit =
+    rtp = rt_new ()
+    match ticker_every rtp 40
+    | Error e -> t.ok ("ticker_unref: could not start: " ++ uv_error_text (ref e)) false
+    | Ok tk ->
+        t.ok "ticker_unref: a fresh ticker counts" (ticker_has_ref tk)
+        t.ok "ticker_unref: and is a reason to keep running" (loop_alive (rt_loop rtp))
+        ticker_unref tk
+        t.ok "ticker_unref: unreferenced, it stops counting" (not (ticker_has_ref tk))
+        t.ok "ticker_unref: and the loop has nothing left to wait for"
+             (not (loop_alive (rt_loop rtp)))
+        ticker_ref tk
+        t.ok "ticker_unref: referencing it again is a reason once more" (loop_alive (rt_loop rtp))
+        // Stopping is the other way to stop counting, and does not release the ticker.
+        ticker_stop tk
+        t.ok "ticker_unref: a stopped ticker is not a reason either"
+             (not (loop_alive (rt_loop rtp)))
+        ticker_close tk
+    shutdown rtp
+    rt_free rtp
+
+// --- the loop's own clock and the descriptor under it ---------------------------------------------
+
+test_loop_clock (t: mut TestState): Unit =
+    rtp = rt_new ()
+    // The clock is read once per turn and cached, so it does not move on its own -- which is
+    // the property that makes every timer in one turn agree about the time.
+    first = rt_now rtp
+    t.ok "loop_clock: the loop has a clock" (first > 0)
+    t.is_i64 "loop_clock: which does not move by itself" (rt_now rtp) first
+    rt_update_time rtp
+    t.ok "loop_clock: until it is told to look again" (rt_now rtp >= first)
+
+    // What an embedder polls to nest this loop inside another one.
+    t.ok "loop_clock: the backend descriptor is real" (rt_backend_fd rtp >= 0)
+    t.ok "loop_clock: an idle loop has nothing to wait for" (rt_backend_timeout rtp == 0)
+    shutdown rtp
+    rt_free rtp
+
+run_timer_tests (t: mut TestState): Unit =
+    test_ticker t
+    test_ticker_no_drift t
+    test_ticker_unref t
+    test_loop_clock t

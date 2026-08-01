@@ -1,0 +1,154 @@
+// What the machine is: the queries in Os.an.
+//
+// Nothing here needs a loop, a task or the Async effect, which is the point of the module and
+// the reason this file is the shortest in the suite. The assertions are deliberately weak where
+// the answer is the machine's business -- a hostname is whatever it is -- and exact where the
+// binding is doing something of its own: the environment round trip, the descriptor kinds, the
+// interface list it has to parse.
+
+import Local.Harness.TestState, ok, is_i32, is_i64, is_usz
+import Local.Uv.Uv.UvError, uv_error_text, getpid
+import Local.Uv.Os.cwd, chdir, exepath, homedir, tmpdir, hostname,
+    sysname, release, machine, uptime_seconds,
+    free_memory, total_memory, cpu_count, cpu_model, cpu_speed_mhz, load_average,
+    get_env, set_env, unset_env, env_or, parent_pid, priority,
+    handle_kind, kind_file, kind_pipe, is_tty, random_bytes,
+    NetInterface, interfaces
+import Std.Vec.Vec, empty, push, len
+import Std.C.malloc, free
+import Std.String.eq_string
+
+export run_os_tests
+
+// --- where the program is ------------------------------------------------------------------------
+
+test_paths (t: mut TestState): Unit =
+    // Absolute, and without a trailing separator: the two things a caller building a path from
+    // one of these depends on.
+    d = cwd ()
+    t.ok "paths: a working directory" (d.length > 0u32 and starts_with (clone d) '/')
+    t.ok "paths: an executable path" (starts_with (exepath ()) '/')
+    t.ok "paths: a home directory" ((homedir ()).length > 0u32)
+    t.ok "paths: a temp directory" (starts_with (tmpdir ()) '/')
+    t.ok "paths: a hostname" ((hostname ()).length > 0u32)
+
+    // Changing directory and changing back: process-wide, so the suite puts it back at once.
+    match chdir "/"
+    | Error e -> t.ok ("paths: chdir: " ++ uv_error_text (ref e)) false
+    | Ok _u -> t.ok "paths: chdir moved" (cwd () == "/")
+    match chdir (clone d)
+    | Error e -> t.ok ("paths: chdir back: " ++ uv_error_text (ref e)) false
+    | Ok _u -> t.ok "paths: and moved back" (cwd () == d)
+
+// Does a string start with this character? Enough for "is it absolute".
+starts_with (s: String) (c: Char): Bool =
+    if s.length == 0u32 then false else (deref_ptr s.data : Char) == c
+
+// --- what the machine is ---------------------------------------------------------------------------
+
+test_machine (t: mut TestState): Unit =
+    t.ok "machine: a system name" ((sysname ()).length > 0u32)
+    t.ok "machine: a release" ((release ()).length > 0u32)
+    t.ok "machine: an architecture" ((machine ()).length > 0u32)
+    t.ok "machine: it has been up for a while" (uptime_seconds () > 0)
+    t.ok "machine: it has memory" (total_memory () > 0)
+    t.ok "machine: some of it free" (free_memory () > 0 and free_memory () <= total_memory ())
+    t.ok "machine: at least one cpu" (cpu_count () >= 1)
+    t.ok "machine: which has a model" ((cpu_model 0).length > 0u32)
+    t.ok "machine: and a clock" (cpu_speed_mhz 0 >= 0)
+    // In thousandths, and never negative. A machine can genuinely be idle, so 0 is allowed.
+    t.ok "machine: a load average" (load_average 0 >= 0)
+    t.ok "machine: a parent process" (parent_pid () > 0)
+    match priority (getpid ())
+    | Ok p -> t.ok "machine: this process has a priority" (p >= -20 and p <= 19)
+    | Error e -> t.ok ("machine: priority: " ++ uv_error_text (ref e)) false
+
+// --- the environment ---------------------------------------------------------------------------------
+
+test_env (t: mut TestState): Unit =
+    name = "AUV_OS_TEST_${getpid ()}"
+    t.ok "env: an unset variable is empty" (get_env (clone name) == "")
+    t.ok "env: and takes the fallback" (env_or (clone name) "fallback" == "fallback")
+    match set_env (clone name) "here"
+    | Error e -> t.ok ("env: set: " ++ uv_error_text (ref e)) false
+    | Ok _u ->
+        t.ok "env: a set variable comes back" (get_env (clone name) == "here")
+        t.ok "env: and is preferred to the fallback" (env_or (clone name) "fallback" == "here")
+    match unset_env (clone name)
+    | Error e -> t.ok ("env: unset: " ++ uv_error_text (ref e)) false
+    | Ok _u -> t.ok "env: unset again" (get_env name == "")
+
+// --- descriptors and randomness ----------------------------------------------------------------------
+
+// Descriptor 0 under the test runner is whatever it was given, so the assertion is about the
+// ones this file can be sure of: a file opened here is a file, and a pipe is a pipe.
+c_open  = extern "open":  fn (Ptr U8) I32 -> I32
+c_close = extern "close": fn I32 -> I32
+c_pipe  = extern "pipe":  fn (Ptr U8) -> I32
+
+test_descriptors (t: mut TestState): Unit =
+    path: Ptr Char = malloc 11usz
+    // "/etc/hosts" as a C string, which every unix has.
+    write_cstr path "/etc/hosts"
+    fd = c_open (transmute path) 0
+    t.ok "descriptors: opened a file" (fd >= 0)
+    if fd >= 0 then
+        t.is_i32 "descriptors: and it is one" (handle_kind fd) (kind_file ())
+        t.ok "descriptors: which is not a terminal" (not (is_tty fd))
+        ignore (c_close fd)
+    free (transmute path)
+
+    fds: Ptr I32 = malloc 8usz
+    ignore (c_pipe (transmute fds))
+    r = deref_ptr fds
+    w = deref_ptr (offset fds 1usz)
+    t.is_i32 "descriptors: a pipe is a pipe" (handle_kind r) (kind_pipe ())
+    ignore (c_close r)
+    ignore (c_close w)
+    free (transmute fds)
+
+// A NUL-terminated copy of `s` into `dst`, which must have room for its bytes and the NUL.
+write_cstr (dst: Ptr Char) (s: String): Unit =
+    var i = 0usz
+    while i < Usz s.length do
+        ptr_store (offset dst i) (deref_ptr (offset s.data i) : Char)
+        i := i + 1usz
+    ptr_store (offset dst i) (transmute 0u8 : Char)
+
+test_random (t: mut TestState): Unit =
+    match random_bytes 32usz
+    | Error e -> t.ok ("random: " ++ uv_error_text (ref e)) false
+    | Ok bytes ->
+        t.is_usz "random: asked for 32 bytes, got 32" (Usz bytes.length) 32usz
+        // Two draws being equal is possible and would be a one-in-2^256 accident, so this is a
+        // test of the source being a source rather than of the bytes themselves.
+        match random_bytes 32usz
+        | Error _e -> t.ok "random: a second draw" false
+        | Ok other -> t.ok "random: two draws differ" (not (bytes == other))
+
+// --- the network as the machine sees it -----------------------------------------------------------
+
+test_interfaces (t: mut TestState): Unit =
+    ifs = interfaces ()
+    t.ok "interfaces: there is at least one" (ifs.len > 0usz)
+    var named = true
+    var addressed = true
+    var loopback = false
+    var i = 0usz
+    while i < ifs.len do
+        e = ptr_to_mut (offset ifs.data i)
+        if e.name.length == 0u32 then named := false
+        if e.address.length == 0u32 then addressed := false
+        if e.internal then loopback := true
+        i := i + 1usz
+    t.ok "interfaces: every one is named" named
+    t.ok "interfaces: every one has an address" addressed
+    t.ok "interfaces: one of them is the loopback" loopback
+
+run_os_tests (t: mut TestState): Unit =
+    test_paths t
+    test_machine t
+    test_env t
+    test_descriptors t
+    test_random t
+    test_interfaces t

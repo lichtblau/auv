@@ -1,0 +1,78 @@
+// Watching a directory: one task waits for changes, another makes them.
+//
+//     ./examples/run.sh watch-dir
+//
+// The watch is a resource, not a callback. `await_change` parks the task until something
+// happens under the path, so a program that reacts to the filesystem is written as an ordinary
+// loop -- read the change, do something about it, come back for the next one.
+//
+// Two things worth knowing before trusting it with anything. Changes COALESCE: two that happen
+// before either is taken are one, because what a watch reports is that something changed, not
+// how many times. And the report can be stale by the time you have it -- a file that appeared
+// may already be gone. What changed is the watch's answer; what it looks like NOW is a question
+// for the filesystem, every time.
+
+import Local.Uv.Run.run_async, spawn_async
+import Local.Uv.Uv.UvError, uv_error_text
+import Local.Uv.Task.Runtime
+import Local.Uv.Async.Async, sleep
+import Local.Uv.Fs.fs_mkdir, fs_rmdir, fs_unlink, write_file
+import Local.Uv.Watch.Watch, copy_watch, watch_path, await_change, watch_close,
+    Change, ch_name, ch_renamed, ch_changed
+import Std.String.eq_string
+
+dir (): String = "/tmp/auv-watch-example"
+
+// A number as decimal text. `String` on its own is the type's constructor, so the cast has to
+// be spelled out.
+num (v: I64): String = cast (I32 v)
+
+// Report `n` changes and stop. Without a limit this would be a program that never ends, which
+// is the honest shape for a watcher and a poor one for an example.
+watcher (rtp: Ptr Runtime) (n: I64): Unit can Async =
+    match watch_path rtp (dir ()) 0
+    | Error e ->
+        // A filesystem with no notification support answers here, and `poll_path` is what to
+        // reach for instead: a stat on a timer, which works everywhere.
+        println ("cannot watch " ++ dir () ++ ": " ++ uv_error_text (ref e))
+    | Ok w ->
+        println ("watching " ++ dir ())
+        var left = n
+        while left > 0 do
+            match await_change w
+            | Error e ->
+                println ("watch ended: " ++ uv_error_text (ref e))
+                left := 0
+            | Ok ch ->
+                what = if ch_renamed (ref ch) and ch_changed (ref ch) then "appeared and changed"
+                       else if ch_renamed (ref ch) then "appeared or went away"
+                       else if ch_changed (ref ch) then "changed"
+                       else "changed somehow"
+                name = ch_name (ref ch)
+                println ("  " ++ (if name == "" then "something" else name) ++ ": " ++ what)
+                left := left - 1
+        watch_close w
+
+// Three edits, spaced out. They are not three REPORTS, and the output shows it: writing a new
+// file is a name appearing and then contents changing, which is two. Edits in a burst go the
+// other way and coalesce into fewer. Neither direction is a defect -- it is why a watcher acts
+// on what it finds on the filesystem rather than on how many times it was told.
+meddler (_rtp: Ptr Runtime) (_n: I64): Unit can Async =
+    sleep 100u64
+    ignore (write_file (dir () ++ "/one.txt") "first\n")
+    sleep 150u64
+    ignore (write_file (dir () ++ "/two.txt") "second\n")
+    sleep 150u64
+    ignore (fs_unlink (dir () ++ "/one.txt"))
+
+both (rtp: Ptr Runtime): Unit can Async =
+    ignore (fs_mkdir (dir ()) 493)              // 0755
+    spawn_async rtp meddler 0
+    watcher rtp 3
+    ignore (fs_unlink (dir () ++ "/one.txt"))
+    ignore (fs_unlink (dir () ++ "/two.txt"))
+    ignore (fs_rmdir (dir ()))
+
+main () =
+    run_async both
+    println "done"

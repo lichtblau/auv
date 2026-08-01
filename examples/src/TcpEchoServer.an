@@ -7,17 +7,21 @@
 //     ./examples/run.sh tcp-echo-client
 //     nc 127.0.0.1 1234
 //
-// Ctrl-C stops it. There is no callback anywhere: a connection handler is a straight-line
-// loop that reads, writes and eventually returns, and the parks inside `aread`/`awrite` are
-// what let one loop carry hundreds of them at once.
+// Ctrl-C stops it, and stops it CLEANLY: a task of its own waits for SIGINT and cancels the
+// accept, so the listener is closed and every connection still open gets to finish. There is
+// no callback anywhere either -- a connection handler is a straight-line loop that reads,
+// writes and eventually returns, and the parks inside `aread`/`awrite` are what let one loop
+// carry hundreds of them at once.
 //
 // Backpressure comes for free. A stream is read only while a task is parked on it, so a
 // connection whose handler is busy stops being read, and that stops the sender.
 
-import Local.Uv.Run.run_async, spawn_stream
-import Local.Uv.Uv.UvError, uv_error_text
-import Local.Uv.Task.Runtime
+import Local.Uv.Run.run_async, spawn_async, spawn_stream
+import Local.Uv.Uv.UvError, uv_error_text, as_i64, as_u64
+import Local.Uv.Task.Runtime, current_id, cancel
 import Local.Uv.Async.Async
+import Local.Uv.Signal.Signal, copy_signal, signal_watch, await_signal, signal_close,
+    signal_unref, sig_int
 import Local.Uv.Stream.Stream, copy_stream, stream_free, stream_fd,
     Listener, copy_listener, listener_bind, listener_close, listener_port, accept,
     AsyncRead, aread, stream_async_read, AsyncWrite, awrite, stream_async_write, ashutdown
@@ -54,6 +58,26 @@ echo (_rtp: Ptr Runtime) (s: Stream): Unit can Async =
     stream_free s
     println (who ++ ": closed after " ++ num bytes ++ " bytes")
 
+// Wait for Ctrl-C and cancel the task that is parked in `accept`, which is what ends the
+// serving loop below. A cancelled park is how one task asks another to stop: nothing unwinds,
+// the accept simply comes back as an error and the loop returns.
+//
+// The watch is UNREFERENCED, and that is the point of `signal_unref`: without it this task --
+// which exists only to shut the program DOWN -- would itself be a reason the loop can never
+// finish, and a server that ran out of work would sit here forever waiting for a Ctrl-C.
+watch_sigint (rtp: Ptr Runtime) (server: I64): Unit can Async =
+    match signal_watch rtp (sig_int ())
+    | Error e -> println ("no SIGINT watch: " ++ uv_error_text (ref e))
+    | Ok sig ->
+        signal_unref sig
+        match await_signal sig
+        | Ok _n ->
+            println ""
+            println "SIGINT: closing the listener, letting open connections finish"
+            cancel rtp (as_u64 server)
+        | Error _e -> ()
+        signal_close sig
+
 // Binding and listening need no task -- only the accept parks -- but doing them here keeps
 // the listener's whole life in one function.
 serve (rtp: Ptr Runtime): Unit can Async =
@@ -62,12 +86,16 @@ serve (rtp: Ptr Runtime): Unit can Async =
     | Ok l ->
         println ("echo server listening on 127.0.0.1:" ++ num (I64 (listener_port l)))
         println "(Ctrl-C to stop)"
+        // The watcher needs to know whom to wake, and a task id is a number, so it travels as
+        // one: `spawn_async` carries an I64 and nothing here has to cast a pointer.
+        spawn_async rtp watch_sigint (as_i64 (current_id rtp))
         var going = true
         while going do
             match accept rtp l
             | Ok s -> spawn_stream rtp echo s
             | Error e ->
-                println ("accept failed: " ++ uv_error_text (ref e))
+                // ECANCELED here is the shutdown above arriving; anything else is real.
+                println ("accepting stopped: " ++ uv_error_text (ref e))
                 going := false
         listener_close l
 

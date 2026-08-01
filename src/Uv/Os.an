@@ -1,0 +1,232 @@
+// What the machine is: the platform answering questions about itself.
+//
+// None of this touches the loop, parks a task, or needs the `Async` effect -- it is all
+// immediate, and it is here because libuv already knows how to ask portably and a program that
+// has this binding should not need a second one for `hostname`.
+//
+// The externs are declared here rather than in Uv.an, which is the arrangement Fs.an's open
+// flags already use: one declarer per symbol, and it is whoever needs it. Nothing below is
+// reachable from any other module, so nothing else has to know these names.
+//
+// A query that fails answers with an empty String or a zero rather than a Result, except where
+// the difference is the whole point (`chdir`, `set_env`, `set_priority`, `random`), which
+// return one. That is a deliberate asymmetry: `hostname ()` is used in a message, and a caller
+// that had to unwrap it would unwrap it into "unknown" every time.
+
+import Local.Uv.Uv.UvError, uv_check, uv_error_of, handle_null, handle_is_null,
+    read_cstr_fn, read_cstr_h, read_cstr0,
+    buf_alloc, buf_free, buf_string, cstr_of_string, cstr_string, as_usz
+import Std.Vec.Vec, empty, push, len
+import Std.C.malloc, free
+
+export
+    cwd, chdir, exepath, homedir, tmpdir, hostname,
+    sysname, release, version, machine,
+    uptime_seconds, free_memory, total_memory, constrained_memory,
+    cpu_count, cpu_model, cpu_speed_mhz, load_average,
+    get_env, set_env, unset_env, env_or,
+    parent_pid, priority, set_priority,
+    HandleKind, handle_kind, kind_unknown, kind_tty, kind_pipe, kind_file, kind_tcp, kind_udp,
+    is_tty, random_bytes,
+    NetInterface, interfaces
+
+auv_os_cwd      = extern "auv_os_cwd":      fn (Ptr U8) Usz -> Usz
+auv_os_exepath  = extern "auv_os_exepath":  fn (Ptr U8) Usz -> Usz
+auv_os_homedir  = extern "auv_os_homedir":  fn (Ptr U8) Usz -> Usz
+auv_os_tmpdir   = extern "auv_os_tmpdir":   fn (Ptr U8) Usz -> Usz
+auv_os_hostname = extern "auv_os_hostname": fn (Ptr U8) Usz -> Usz
+auv_os_chdir    = extern "auv_os_chdir":    fn (Ptr U8) -> I32
+auv_os_uname    = extern "auv_os_uname":    fn I32 (Ptr U8) Usz -> Usz
+auv_os_uptime   = extern "auv_os_uptime":   fn Unit -> I64
+
+auv_os_free_memory        = extern "auv_os_free_memory":        fn Unit -> I64
+auv_os_total_memory       = extern "auv_os_total_memory":       fn Unit -> I64
+auv_os_constrained_memory = extern "auv_os_constrained_memory": fn Unit -> I64
+auv_os_cpu_count          = extern "auv_os_cpu_count":          fn Unit -> I32
+auv_os_cpu_model          = extern "auv_os_cpu_model":          fn I32 (Ptr U8) Usz -> Usz
+auv_os_cpu_speed          = extern "auv_os_cpu_speed":          fn I32 -> I64
+auv_os_loadavg_milli      = extern "auv_os_loadavg_milli":      fn I32 -> I64
+
+auv_os_getenv      = extern "auv_os_getenv":      fn (Ptr U8) (Ptr U8) Usz -> Usz
+auv_os_setenv      = extern "auv_os_setenv":      fn (Ptr U8) (Ptr U8) -> I32
+auv_os_unsetenv    = extern "auv_os_unsetenv":    fn (Ptr U8) -> I32
+auv_os_getppid     = extern "auv_os_getppid":     fn Unit -> I32
+auv_os_getpriority = extern "auv_os_getpriority": fn I32 (Ptr U8) -> I32
+auv_os_setpriority = extern "auv_os_setpriority": fn I32 I32 -> I32
+auv_guess_handle   = extern "auv_guess_handle":   fn I32 -> I32
+auv_random         = extern "auv_random":         fn (Ptr U8) Usz -> I32
+auv_os_interfaces  = extern "auv_os_interfaces":  fn (Ptr U8) Usz -> Usz
+
+// --- where the program is -------------------------------------------------------------------
+
+/// This process's working directory, without a trailing separator.
+cwd (): String = read_cstr0 auv_os_cwd
+
+/// Change it. Process-wide and not thread-safe, which is why it is a Result rather than
+/// something to do casually: every relative path in the program means something else afterwards.
+chdir (path: ref String): Result Unit UvError =
+    p = cstr_of_string path
+    r = auv_os_chdir p
+    buf_free p
+    uv_check (I64 r)
+
+/// The running executable's own path, resolved -- what argv[0] should have been.
+exepath (): String = read_cstr0 auv_os_exepath
+
+/// $HOME, or the password database's answer where that is unset.
+homedir (): String = read_cstr0 auv_os_homedir
+
+/// $TMPDIR and friends, or the platform's default. Without a trailing separator.
+tmpdir (): String = read_cstr0 auv_os_tmpdir
+
+hostname (): String = read_cstr0 auv_os_hostname
+
+// --- what the machine is --------------------------------------------------------------------
+
+/// uname's four parts: "Linux", "6.12.43", the build string, "x86_64".
+sysname (): String = read_cstr_fn auv_os_uname 0
+release (): String = read_cstr_fn auv_os_uname 1
+version (): String = read_cstr_fn auv_os_uname 2
+machine (): String = read_cstr_fn auv_os_uname 3
+
+/// Seconds since the machine booted, or -1 where the platform will not say.
+uptime_seconds (): I64 = auv_os_uptime ()
+
+free_memory (): I64 = auv_os_free_memory ()
+total_memory (): I64 = auv_os_total_memory ()
+
+/// What a cgroup allows this process, which on a container is the number that matters and is
+/// not the machine's total. 0 when there is no limit.
+constrained_memory (): I64 = auv_os_constrained_memory ()
+
+/// How many threads it is worth running -- not always how many CPUs exist, because it honors
+/// the container's allowance where there is one.
+cpu_count (): I32 = auv_os_cpu_count ()
+
+/// One core's model string and clock. Each call asks the platform afresh, so a program printing
+/// every core should not be surprised by the cost.
+cpu_model (i: I32): String = read_cstr_fn auv_os_cpu_model i
+cpu_speed_mhz (i: I32): I64 = auv_os_cpu_speed i
+
+/// The 1, 5 and 15 minute load averages, in THOUSANDTHS, because this binding carries no
+/// floating point across the boundary: 1500 is a load of 1.5. Zero everywhere but unix.
+load_average (which: I32): I64 = auv_os_loadavg_milli which
+
+// --- the environment ------------------------------------------------------------------------
+
+/// The value of an environment variable, or "" when it is unset. `env_or` is the version that
+/// says what to use instead.
+get_env (name: ref String): String =
+    p = cstr_of_string name
+    v = read_cstr_h auv_os_getenv p
+    buf_free p
+    v
+
+env_or (name: ref String) (fallback: String): String =
+    v = get_env name
+    if v.length == 0u32 then fallback else v
+
+set_env (name: ref String) (value: ref String): Result Unit UvError =
+    n = cstr_of_string name
+    v = cstr_of_string value
+    r = auv_os_setenv n v
+    buf_free n
+    buf_free v
+    uv_check (I64 r)
+
+unset_env (name: ref String): Result Unit UvError =
+    n = cstr_of_string name
+    r = auv_os_unsetenv n
+    buf_free n
+    uv_check (I64 r)
+
+// --- this process ---------------------------------------------------------------------------
+
+parent_pid (): I32 = auv_os_getppid ()
+
+/// The scheduling priority of a process, -20 (most) to 19 (least). 0 for `pid` means this one.
+priority (pid: I32): Result I32 UvError =
+    cell = buf_alloc 4usz
+    r = auv_os_getpriority pid cell
+    v = if r == 0 then i32_of cell else 0
+    buf_free cell
+    if r != 0 then Error (uv_error_of r) else Ok v
+
+/// Lowering it needs no privilege; raising it back afterwards does.
+set_priority (pid: I32) (prio: I32): Result Unit UvError = uv_check (I64 (auv_os_setpriority pid prio))
+
+// One I32 out of a shim buffer. `i32_at` would do, and this says which one without an index.
+auv_i32_at = extern "auv_i32_at": fn (Ptr U8) Usz -> I32
+i32_of (p: Ptr U8): I32 = auv_i32_at p 0usz
+
+// --- descriptors ------------------------------------------------------------------------------
+
+type HandleKind = kind: I32
+
+impl copy_handlekind: Copy HandleKind with (.*) = deref
+
+kind_unknown (): I32 = 0
+kind_tty (): I32 = 1
+kind_pipe (): I32 = 2
+kind_file (): I32 = 3
+kind_tcp (): I32 = 4
+kind_udp (): I32 = 5
+
+/// What a descriptor IS. How a program decides whether it is talking to a person: output to a
+/// terminal gets colour and progress, output to a pipe gets neither.
+handle_kind (fd: I32): I32 = auv_guess_handle fd
+
+/// Is this descriptor a terminal? `handle_kind` with the usual question asked directly.
+is_tty (fd: I32): Bool = auv_guess_handle fd == kind_tty ()
+
+// --- randomness --------------------------------------------------------------------------------
+
+/// `n` cryptographically strong bytes from the platform's own source, as a String -- which is
+/// this binding's byte buffer, and is not text.
+random_bytes (n: Usz): Result String UvError =
+    if n == 0usz then Ok ""
+    else
+        buf = buf_alloc n
+        r = auv_random buf n
+        out = buf_string buf n
+        buf_free buf
+        if r != 0 then Error (uv_error_of r) else Ok out
+
+// --- the network as the machine sees it -----------------------------------------------------------
+
+/// One address on one network interface. A machine has several of these per interface, one per
+/// address family, and `internal` is what separates the loopback from the rest.
+type NetInterface =
+    name: String
+    address: String
+    internal: Bool
+
+/// Every address on every interface. The shim marshals them as one line each, "<i|e><name>TAB
+/// <address>", the same newline-separated shape a directory listing uses.
+interfaces (): Vec NetInterface =
+    text = read_cstr0 auv_os_interfaces
+    var out: Vec NetInterface = Vec.empty ()
+    n = Usz text.length
+    var start = 0usz
+    var i = 0usz
+    while i < n do
+        ch: Char = deref_ptr (offset text.data i)
+        if ch == '\n' then
+            // The line is "<flag><name>\t<address>"; anything without both is not one.
+            var tab = start
+            var j = start
+            while j < i do
+                if (deref_ptr (offset text.data j) : Char) == '\t' then
+                    tab := j
+                    j := i
+                else j := j + 1usz
+            if tab > start + 1usz then
+                // Each piece is COPIED out rather than sharing this buffer, for the reason
+                // Fs.an's line readers give: the pieces outlive the text they came from.
+                flag: Char = deref_ptr (offset text.data start)
+                nm = buf_string (transmute (offset text.data (start + 1usz))) (tab - start - 1usz)
+                ad = buf_string (transmute (offset text.data (tab + 1usz))) (i - tab - 1usz)
+                out.push (NetInterface nm ad (flag == 'i'))
+            start := i + 1usz
+        i := i + 1usz
+    out

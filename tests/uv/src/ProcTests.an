@@ -8,11 +8,14 @@ import Local.Uv.Task.Runtime, rt_new, rt_free, rt_loop, rt_live_count,
     spawn_default, run, shutdown, sleep_ms
 import Local.Uv.Async.Async, run_uv, sleep
 import Local.Uv.Stream.Stream, copy_stream, stream_free, stream_close, stream_adopt_fd,
+    stream_is_null,
     AsyncRead, aread, stream_async_read, AsyncWrite, awrite, stream_async_write,
     ashutdown, read_all
 import Local.Uv.Proc.Child, copy_child, Exit, copy_exit, exit_code, exit_signal,
     exited_normally, spawn_child, wait_exit, kill_child, child_close, child_close_stdin, child_pid,
-    child_stdin, child_stdout, child_stderr
+    child_stdin, child_stdout, child_stderr,
+    SpawnOpts, copy_spawnopts, spawn_opts, spawn_child_with, child_unref,
+    stdio_ignore, stdio_pipe, stdio_inherit, with_stdio, with_env, with_detached
 import Std.Vec.Vec, empty, push, len
 import Std.C.malloc, free
 import Std.String.eq_string
@@ -288,9 +291,118 @@ test_missing_program (t: mut TestState): Unit =
     free (transmute err)
     free (transmute args)
 
+// --- everything else uv_spawn can be told ---------------------------------------------------------
+//
+// An environment of the child's own, a working directory of its own, and a stream it does not
+// get a pipe for. The last is the one that could not be said at all before: a child could have
+// a pipe or nothing, so it could never be handed this process's own terminal.
+
+opts_task (p: Ptr U8): Unit =
+    arg = parg_of p
+    run_uv arg.rt fn () ->
+        var argv: Vec String = Vec.empty ()
+        argv.push "-c"
+        // Both answers at once: the variable proves the environment was replaced rather than
+        // added to, and `pwd` proves the working directory was set.
+        argv.push "echo \"$AUV_TEST_TOKEN in $(pwd)\"; echo noise >&2"
+        var env: Vec String = Vec.empty ()
+        env.push "AUV_TEST_TOKEN=token"
+        // stderr is ignored rather than piped, so there is no Stream for it on this side.
+        o = with_env (with_stdio (spawn_opts ()) (stdio_ignore ()) (stdio_pipe ())
+                                                 (stdio_ignore ())) true
+        match spawn_child_with arg.rt "/bin/sh" (ref argv) o "/tmp" (ref env)
+        | Error _e -> log_push arg.log -1
+        | Ok ch ->
+            var c = ch
+            log_push arg.log (if stream_is_null (child_stderr (ref c)) then 1 else -2)
+            log_push arg.log (if stream_is_null (child_stdin (ref c)) then 1 else -3)
+            match read_all (child_stdout (ref c))
+            | Ok text -> ptr_store arg.out text
+            | Error _e -> log_push arg.log -4
+            match wait_exit (ref c)
+            | Ok st -> log_push arg.log (exit_code st)
+            | Error _e -> log_push arg.log -5
+            child_close (mut c)
+
+test_spawn_opts (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    out = new_text ()
+    err = new_text ()
+    args = new_pargs 1usz
+    ptr_store (parg_slot args 0usz) (PArg rtp lg out err 0)
+    ignore (spawn_default rtp (transmute (opts_task : fn (Ptr U8) -> Unit))
+                              (transmute (parg_slot args 0usz)))
+    run rtp
+
+    t.is_usz "spawn_opts: every step reported" (log_len lg) 3usz
+    t.is_i64 "spawn_opts: an ignored stderr has no stream on this side" (log_at lg 0usz) 1
+    t.is_i64 "spawn_opts: nor an ignored stdin" (log_at lg 1usz) 1
+    t.is_i64 "spawn_opts: the child exited cleanly" (log_at lg 2usz) 0
+    t.ok "spawn_opts: it had the environment and the directory it was given"
+         (text_get out == "token in /tmp\n")
+
+    shutdown rtp
+    rt_free rtp
+    free_log lg
+    free (transmute out)
+    free (transmute err)
+    free (transmute args)
+
+// --- a child that outlives the wait ------------------------------------------------------------
+//
+// Detached and unreferenced: the child is in a process group of its own and is no longer a
+// reason for the loop to keep running, so `run` returns while it is still going. That pair is
+// what "start it and forget it" means -- either alone leaves something behind.
+
+detach_task (p: Ptr U8): Unit =
+    arg = parg_of p
+    run_uv arg.rt fn () ->
+        var argv: Vec String = Vec.empty ()
+        argv.push "-c"
+        argv.push "sleep 30"
+        o = with_detached (with_stdio (spawn_opts ()) (stdio_ignore ()) (stdio_ignore ())
+                                                      (stdio_ignore ())) true
+        var noenv: Vec String = Vec.empty ()
+        match spawn_child_with arg.rt "/bin/sh" (ref argv) o "" (ref noenv)
+        | Error _e -> log_push arg.log -1
+        | Ok ch ->
+            var c = ch
+            log_push arg.log (if child_pid (ref c) > 0 then 1 else -2)
+            child_unref (ref c)
+            // Deliberately NOT waited on: the point is that the loop lets go of it. Killing it
+            // afterwards keeps the suite from leaving a sleeping process on the machine.
+            log_push arg.log (I64 (kill_child (ref c) (sigterm ())))
+            child_close (mut c)
+
+test_detached (t: mut TestState): Unit =
+    rtp = rt_new ()
+    lg = new_log ()
+    out = new_text ()
+    err = new_text ()
+    args = new_pargs 1usz
+    ptr_store (parg_slot args 0usz) (PArg rtp lg out err 0)
+    ignore (spawn_default rtp (transmute (detach_task : fn (Ptr U8) -> Unit))
+                              (transmute (parg_slot args 0usz)))
+    run rtp
+
+    t.is_usz "detached: the child started" (log_len lg) 2usz
+    t.is_i64 "detached: with a pid of its own" (log_at lg 0usz) 1
+    t.is_i64 "detached: and could still be signalled" (log_at lg 1usz) 0
+    t.is_usz "detached: run returned without waiting for it" (rt_live_count rtp) 0usz
+
+    shutdown rtp
+    rt_free rtp
+    free_log lg
+    free (transmute out)
+    free (transmute err)
+    free (transmute args)
+
 run_proc_tests (t: mut TestState): Unit =
     test_missing_program t
     test_adopt_fd t
     test_capture t
     test_write_to_child t
+    test_spawn_opts t
+    test_detached t
     test_kill t
