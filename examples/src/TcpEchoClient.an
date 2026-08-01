@@ -7,11 +7,11 @@
 // code -- connect, write, half-close, read -- and they still overlap, because every step that
 // waits parks its own task instead of the program.
 
-import Local.Uv.Run.run_async, spawn_async
-import Local.Uv.Uv.UvError, uv_error_text
-import Local.Uv.Task.Runtime
-import Local.Uv.Async.Async
-import Local.Uv.Stream.Stream, copy_stream, stream_free, connect,
+import Auv.Uv.Run.run_async, spawn_async
+import Auv.Uv.Uv.UvError, uv_error_text
+import Auv.Uv.Task.Runtime
+import Auv.Uv.Async.Async
+import Auv.Uv.Stream.Stream, copy_stream, stream_free, connect,
     AsyncWrite, awrite, stream_async_write, AsyncRead, aread, stream_async_read,
     ashutdown, read_all
 

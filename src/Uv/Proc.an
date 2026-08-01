@@ -10,14 +10,14 @@
 // uv_tty is deliberately absent. Adopting a terminal collides with whatever else in the
 // program is managing raw mode, and that is a decision for the program, not for a binding.
 
-import Local.Uv.Uv.Loop, copy_loop, Slot, copy_slot, slot_new, Completion, copy_completion,
+import Auv.Uv.Uv.Loop, copy_loop, Slot, copy_slot, slot_new, Completion, copy_completion,
     k_exit, k_cancelled, UvError, uv_error_of,
     handle_null, handle_is_null, handle_adopt_slot, handle_unref, close_handle,
     pipe_new, process_spawn, process_spawn_with, process_kill, process_pid,
     buf_alloc, buf_free, ptr_at, ptr_set, cstr_of_string, i32_at, as_i64
-import Local.Uv.Task.Runtime, rt_loop
-import Local.Uv.Async.Async, submit, Submission, copy_submission, sub_op2, op_wait_exit
-import Local.Uv.Stream.Stream, copy_stream, stream_null, stream_is_null, stream_of_handle,
+import Auv.Uv.Task.Runtime, rt_loop
+import Auv.Uv.Async.Async, submit, Submission, copy_submission, sub_op2, op_wait_exit
+import Auv.Uv.Stream.Stream, copy_stream, stream_null, stream_is_null, stream_of_handle,
     stream_close
 import Std.Vec.Vec, empty, push, len
 

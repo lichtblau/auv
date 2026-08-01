@@ -17,7 +17,7 @@
 // exactly the freeze parking exists to remove, so both ends report ENOSYS instead; see the note
 // on `perform_blocking`.
 
-import Local.Uv.Uv.Loop, copy_loop, Slot, copy_slot, slot_new,
+import Auv.Uv.Uv.Loop, copy_loop, Slot, copy_slot, slot_new,
     Completion, copy_completion, k_cancelled, k_closed,
     UvError, uv_check, uv_error_of,
     handle_null, handle_is_null, handle_adopt_slot, handle_ref, handle_unref, handle_has_ref,
@@ -27,8 +27,8 @@ import Local.Uv.Uv.Loop, copy_loop, Slot, copy_slot, slot_new,
     udp_set_multicast_ttl, udp_membership,
     dgram_header, dgram_ip_len, dgram_port,
     buf_string_at, buf_free, cstr_of_string, as_i64, as_usz
-import Local.Uv.Task.Runtime, rt_loop
-import Local.Uv.Async.Async, submit, Submission, copy_submission, sub_op2, sub_udp_send,
+import Auv.Uv.Task.Runtime, rt_loop
+import Auv.Uv.Async.Async, submit, Submission, copy_submission, sub_op2, sub_udp_send,
     op_udp_recv, op_udp_send
 import Std.C.malloc, free
 

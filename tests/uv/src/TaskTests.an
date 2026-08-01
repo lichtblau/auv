@@ -4,10 +4,10 @@
 // argument reached through a heap record. Every suite below follows that shape: allocate the
 // per-task arguments up front, spawn, run, assert on what the tasks recorded.
 
-import Local.Harness.TestState, ok, is_i32, is_i64, is_usz
-import Local.Uv.Uv.Loop, copy_loop, Slot, copy_slot, slot_rearm, slot_deliver, Completion, copy_completion,
+import UvTests.Harness.TestState, ok, is_i32, is_i64, is_usz
+import Auv.Uv.Uv.Loop, copy_loop, Slot, copy_slot, slot_rearm, slot_deliver, Completion, copy_completion,
     k_timer, k_async, k_cancelled, k_joined, k_none, handle_null, handle_is_null, as_i64
-import Local.Uv.Task.Runtime, rt_new, rt_free, rt_loop, rt_live_count, rt_task_count,
+import Auv.Uv.Task.Runtime, rt_new, rt_free, rt_loop, rt_live_count, rt_task_count,
     spawn, spawn_default, park, run, shutdown, current_slot, current_id, on_own_stack, set_result,
     sleep_ms, task_sleep
 import Std.Vec.Vec, empty, push, len

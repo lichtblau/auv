@@ -20,7 +20,7 @@
 // Neither is offered under the `blocking` handler: watching a path is a loop watching it, and a
 // stat taken here and now would be an answer to a different question. Both report ENOSYS.
 
-import Local.Uv.Uv.Loop, copy_loop, Slot, copy_slot, slot_new,
+import Auv.Uv.Uv.Loop, copy_loop, Slot, copy_slot, slot_new,
     Completion, copy_completion, k_cancelled, k_closed, k_fsevent,
     UvError, uv_error_of,
     handle_null, handle_is_null, handle_adopt_slot, handle_ref, handle_unref, handle_has_ref,
@@ -28,9 +28,9 @@ import Local.Uv.Uv.Loop, copy_loop, Slot, copy_slot, slot_new,
     fs_event_new, fs_event_start, fs_poll_new, fs_poll_start,
     fs_event_recursive, fsevent_header, fsevent_renamed, fsevent_changed,
     buf_string_at, buf_free, as_usz
-import Local.Uv.Task.Runtime, rt_loop
-import Local.Uv.Async.Async, submit, Submission, copy_submission, sub_op2, op_watch
-import Local.Uv.Fs.FileInfo, copy_fileinfo, file_info_of
+import Auv.Uv.Task.Runtime, rt_loop
+import Auv.Uv.Async.Async, submit, Submission, copy_submission, sub_op2, op_watch
+import Auv.Uv.Fs.FileInfo, copy_fileinfo, file_info_of
 import Std.C.malloc, free
 
 export

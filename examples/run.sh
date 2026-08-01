@@ -10,7 +10,8 @@
 # is a single self-contained file next to the others, the way a luvit example is a single .lua
 # file, rather than a directory with its own manifest.
 #
-# src/Uv is a symlink to the library; the compiler follows it like a real directory.
+# deps/Auv is a symlink to the library's crate root; the compiler follows it like a real
+# directory and every example imports the library as `Auv.Uv.*`.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 . "$here/../scripts/lib.sh"
@@ -53,7 +54,7 @@ mkdir -p "$here/build"
 auv_build_shim "$here/build"
 mapfile -t link < <(auv_link_flags "$here/build")
 ante_build "$here" --backend c "${link[@]}" --bin "$module"
-mv "$here/auv-example" "$here/build/$name"
+mv "$here/AuvExample" "$here/build/$name"
 rm -f "$here/a.out.c"
 
 exec "$here/build/$name" "$@"

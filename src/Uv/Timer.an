@@ -21,14 +21,14 @@
 // `sleep` is what a program with no loop has, and it is enough for one that is not competing
 // with anything.
 
-import Local.Uv.Uv.Loop, copy_loop, Slot, copy_slot, slot_new,
+import Auv.Uv.Uv.Loop, copy_loop, Slot, copy_slot, slot_new,
     Completion, copy_completion, k_cancelled, k_closed, k_timer,
     UvError, uv_error_of,
     handle_null, handle_is_null, handle_adopt_slot, handle_ref, handle_unref, handle_has_ref,
     close_handle, close_handle_waking,
     timer_new, timer_start, timer_stop
-import Local.Uv.Task.Runtime, rt_loop
-import Local.Uv.Async.Async, submit, Submission, copy_submission, sub_op2, op_watch
+import Auv.Uv.Task.Runtime, rt_loop
+import Auv.Uv.Async.Async, submit, Submission, copy_submission, sub_op2, op_watch
 import Std.C.malloc, free
 
 export

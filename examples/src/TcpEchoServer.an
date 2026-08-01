@@ -16,13 +16,13 @@
 // Backpressure comes for free. A stream is read only while a task is parked on it, so a
 // connection whose handler is busy stops being read, and that stops the sender.
 
-import Local.Uv.Run.run_async, spawn_async, spawn_stream
-import Local.Uv.Uv.UvError, uv_error_text, as_i64, as_u64
-import Local.Uv.Task.Runtime, current_id, cancel
-import Local.Uv.Async.Async
-import Local.Uv.Signal.Signal, copy_signal, signal_watch, await_signal, signal_close,
+import Auv.Uv.Run.run_async, spawn_async, spawn_stream
+import Auv.Uv.Uv.UvError, uv_error_text, as_i64, as_u64
+import Auv.Uv.Task.Runtime, current_id, cancel
+import Auv.Uv.Async.Async
+import Auv.Uv.Signal.Signal, copy_signal, signal_watch, await_signal, signal_close,
     signal_unref, sig_int
-import Local.Uv.Stream.Stream, copy_stream, stream_free, stream_fd,
+import Auv.Uv.Stream.Stream, copy_stream, stream_free, stream_fd,
     Listener, copy_listener, listener_bind, listener_close, listener_port, accept,
     AsyncRead, aread, stream_async_read, AsyncWrite, awrite, stream_async_write, ashutdown
 

@@ -11,11 +11,11 @@
 // Either kind of address printed below goes straight into `connect` -- the v6 ones too, which
 // was not true until `connect` learned to parse both families.
 
-import Local.Uv.Run.run_async, spawn_async
-import Local.Uv.Uv.UvError, uv_error_text
-import Local.Uv.Task.Runtime
-import Local.Uv.Async.Async, blocking
-import Local.Uv.Fs.resolve
+import Auv.Uv.Run.run_async, spawn_async
+import Auv.Uv.Uv.UvError, uv_error_text
+import Auv.Uv.Task.Runtime
+import Auv.Uv.Async.Async, blocking
+import Auv.Uv.Fs.resolve
 import Std.Vec.Vec, len
 
 // A number as decimal text. `String` on its own is the type's constructor, so the cast has to

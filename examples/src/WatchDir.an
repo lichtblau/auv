@@ -12,12 +12,12 @@
 // may already be gone. What changed is the watch's answer; what it looks like NOW is a question
 // for the filesystem, every time.
 
-import Local.Uv.Run.run_async, spawn_async
-import Local.Uv.Uv.UvError, uv_error_text
-import Local.Uv.Task.Runtime
-import Local.Uv.Async.Async, sleep
-import Local.Uv.Fs.fs_mkdir, fs_rmdir, fs_unlink, write_file
-import Local.Uv.Watch.Watch, copy_watch, watch_path, await_change, watch_close,
+import Auv.Uv.Run.run_async, spawn_async
+import Auv.Uv.Uv.UvError, uv_error_text
+import Auv.Uv.Task.Runtime
+import Auv.Uv.Async.Async, sleep
+import Auv.Uv.Fs.fs_mkdir, fs_rmdir, fs_unlink, write_file
+import Auv.Uv.Watch.Watch, copy_watch, watch_path, await_change, watch_close,
     Change, ch_name, ch_renamed, ch_changed
 import Std.String.eq_string
 

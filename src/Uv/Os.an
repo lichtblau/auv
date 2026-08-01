@@ -13,7 +13,7 @@
 // return one. That is a deliberate asymmetry: `hostname ()` is used in a message, and a caller
 // that had to unwrap it would unwrap it into "unknown" every time.
 
-import Local.Uv.Uv.UvError, uv_check, uv_error_of, handle_null, handle_is_null,
+import Auv.Uv.Uv.UvError, uv_check, uv_error_of, handle_null, handle_is_null,
     read_cstr_fn, read_cstr_h, read_cstr0,
     buf_alloc, buf_free, buf_string, cstr_of_string, cstr_string, as_usz
 import Std.Vec.Vec, empty, push, len

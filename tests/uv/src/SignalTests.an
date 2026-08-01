@@ -4,13 +4,13 @@
 // no outside help and disturbs nothing else. Watching replaces the default disposition, which
 // for these two is "terminate", so a watch is always open before anything is raised.
 
-import Local.Harness.TestState, ok, is_i32, is_i64, is_usz
-import Local.Uv.Uv.UvError, uv_error_text, uv_err_name_of, handle_is_null, loop_alive,
+import UvTests.Harness.TestState, ok, is_i32, is_i64, is_usz
+import Auv.Uv.Uv.UvError, uv_error_text, uv_err_name_of, handle_is_null, loop_alive,
     loop_thread_faults, getpid, kill_pid, as_i64, as_u64
-import Local.Uv.Task.Runtime, rt_new, rt_free, rt_loop, rt_live_count, rt_task_count,
+import Auv.Uv.Task.Runtime, rt_new, rt_free, rt_loop, rt_live_count, rt_task_count,
     spawn_default, run, shutdown, cancel, sleep_ms
-import Local.Uv.Async.Async, run_uv, blocking, sleep, sleep_unref
-import Local.Uv.Signal.Signal, copy_signal, signal_watch, await_signal, signal_close,
+import Auv.Uv.Async.Async, run_uv, blocking, sleep, sleep_unref
+import Auv.Uv.Signal.Signal, copy_signal, signal_watch, await_signal, signal_close,
     signal_ref, signal_unref, signal_has_ref, signal_signum, sig_usr1, sig_usr2
 import Std.Vec.Vec, empty, push, len
 import Std.C.malloc, free

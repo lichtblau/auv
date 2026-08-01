@@ -5,15 +5,15 @@
 // failing it, and "never fires" is a real possibility here: inotify is a kernel service that a
 // filesystem or a container may simply not offer.
 
-import Local.Harness.TestState, ok, is_i32, is_i64, is_usz
-import Local.Uv.Uv.UvError, uv_error_text, uv_err_name_of, handle_is_null, loop_alive,
+import UvTests.Harness.TestState, ok, is_i32, is_i64, is_usz
+import Auv.Uv.Uv.UvError, uv_error_text, uv_err_name_of, handle_is_null, loop_alive,
     loop_thread_faults, getpid, as_i64, as_u64
-import Local.Uv.Task.Runtime, rt_new, rt_free, rt_loop, rt_live_count, rt_task_count,
+import Auv.Uv.Task.Runtime, rt_new, rt_free, rt_loop, rt_live_count, rt_task_count,
     spawn_default, run, shutdown, cancel, sleep_ms
-import Local.Uv.Async.Async, run_uv, blocking, sleep, sleep_unref
-import Local.Uv.Fs.FileInfo, copy_fileinfo, fi_size,
+import Auv.Uv.Async.Async, run_uv, blocking, sleep, sleep_unref
+import Auv.Uv.Fs.FileInfo, copy_fileinfo, fi_size,
     fs_mkdir, fs_rmdir, fs_unlink, write_file
-import Local.Uv.Watch.Watch, copy_watch, watch_path, poll_path, watch_is_poll,
+import Auv.Uv.Watch.Watch, copy_watch, watch_path, poll_path, watch_is_poll,
     await_change, await_poll, watch_close, watch_ref, watch_unref, watch_has_ref,
     Change, ch_name, ch_renamed, ch_changed
 import Std.Vec.Vec, empty, push, len

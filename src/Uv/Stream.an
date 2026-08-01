@@ -20,7 +20,7 @@
 // One task reads a stream at a time. Two readers would park on one slot, which the slot
 // refuses outright.
 
-import Local.Uv.Uv.Loop, copy_loop, Slot, copy_slot, slot_new,
+import Auv.Uv.Uv.Loop, copy_loop, Slot, copy_slot, slot_new,
     Completion, copy_completion,
     k_eof, k_cancelled, k_closed,
     UvError, uv_check, uv_error_of,
@@ -33,8 +33,8 @@ import Local.Uv.Uv.Loop, copy_loop, Slot, copy_slot, slot_new,
     stream_readable, stream_writable,
     stream_write_queue, stream_fileno, buf_string, buf_free, buf_alloc, i32_at, i32_set,
     cstr_of_string, as_usz, as_i64
-import Local.Uv.Task.Runtime, rt_loop
-import Local.Uv.Async.Async, submit, Submission, copy_submission, sub_op2, sub_op3,
+import Auv.Uv.Task.Runtime, rt_loop
+import Auv.Uv.Async.Async, submit, Submission, copy_submission, sub_op2, sub_op3,
     op_read, op_write, op_connect, op_pipe_connect, op_accept, op_shutdown
 import Std.C.malloc, free
 

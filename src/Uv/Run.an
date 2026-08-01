@@ -21,9 +21,9 @@
 // to that signature compiles and then segfaults. An effectful function POINTER does survive
 // the round trip, which is what these three are built on.
 
-import Local.Uv.Task.Runtime, rt_new, rt_free, spawn_default, run, shutdown
-import Local.Uv.Async.Async, run_uv
-import Local.Uv.Stream.Stream, copy_stream
+import Auv.Uv.Task.Runtime, rt_new, rt_free, spawn_default, run, shutdown
+import Auv.Uv.Async.Async, run_uv
+import Auv.Uv.Stream.Stream, copy_stream
 import Std.C.malloc, free
 
 export run_async, spawn_async, spawn_stream

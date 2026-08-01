@@ -14,10 +14,10 @@
 // (there is no libc copyfile, so the blocking path is the read/write loop it stands for) and
 // `fs_statfs` (statvfs(3) is the portable one and does not carry the filesystem type).
 
-import Local.Uv.Uv.Completion, copy_completion, k_fs, k_addrinfo, k_cancelled,
+import Auv.Uv.Uv.Completion, copy_completion, k_fs, k_addrinfo, k_cancelled,
     UvError, uv_check, uv_error_of,
     handle_null, handle_is_null, buf_free, buf_string, cstr_of_string, as_i64, as_usz
-import Local.Uv.Async.Async, submit, Submission, copy_submission, op_fs, op_addrinfo,
+import Auv.Uv.Async.Async, submit, Submission, copy_submission, op_fs, op_addrinfo,
     op_nameinfo, sub_fs, sub_addrinfo, sub_nameinfo
 import Std.Vec.Vec, empty, push, len
 

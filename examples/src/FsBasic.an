@@ -7,11 +7,11 @@
 // and the task parks until the result lands, and once under `blocking`, where plain libc does
 // it on main's own stack -- no loop, no task, no coroutine. Same code, two handlers.
 
-import Local.Uv.Run.run_async
-import Local.Uv.Uv.UvError, uv_error_text
-import Local.Uv.Task.Runtime
-import Local.Uv.Async.Async, blocking
-import Local.Uv.Fs.FileInfo, copy_fileinfo, fi_size, fi_is_dir,
+import Auv.Uv.Run.run_async
+import Auv.Uv.Uv.UvError, uv_error_text
+import Auv.Uv.Task.Runtime
+import Auv.Uv.Async.Async, blocking
+import Auv.Uv.Fs.FileInfo, copy_fileinfo, fi_size, fi_is_dir,
     DirEntry, fs_mkdir, fs_rmdir, fs_unlink, fs_stat, fs_scandir_entries,
     read_file, write_file,
     FsInfo, copy_fsinfo, fst_bytes_available,

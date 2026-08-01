@@ -3,14 +3,14 @@
 // Every scenario binds to port 0 and asks the kernel which port it got, so the tests never
 // collide with each other or with anything else on the machine.
 
-import Local.Harness.TestState, ok, is_i32, is_i64, is_usz
-import Local.Uv.Uv.Completion, copy_completion, handle_is_null, loop_alive, loop_thread_faults,
+import UvTests.Harness.TestState, ok, is_i32, is_i64, is_usz
+import Auv.Uv.Uv.Completion, copy_completion, handle_is_null, loop_alive, loop_thread_faults,
     loop_read_stops, UvError, uv_error_text, uv_err_name_of, buf_alloc, buf_free, i32_at,
     socketpair_fds, fd_close, as_i64, cstr_of_string, getpid
-import Local.Uv.Task.Runtime, rt_new, rt_free, rt_loop, rt_live_count, rt_task_count,
+import Auv.Uv.Task.Runtime, rt_new, rt_free, rt_loop, rt_live_count, rt_task_count,
     spawn_default, spawn, run, shutdown, cancel, sleep_ms
-import Local.Uv.Async.Async, run_uv, sleep
-import Local.Uv.Stream.Stream, copy_stream, stream_free, stream_close, stream_is_null,
+import Auv.Uv.Async.Async, run_uv, sleep
+import Auv.Uv.Stream.Stream, copy_stream, stream_free, stream_close, stream_is_null,
     stream_adopt_fd, stream_at_eof, stream_pending_writes,
     stream_local_addr, stream_peer_addr, stream_local_port, stream_peer_port,
     stream_local_path, stream_peer_path, stream_peer_cred, stream_nodelay, stream_keepalive,

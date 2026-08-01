@@ -8,13 +8,13 @@
 // waits in the process handle until it is asked for and draining the output first is always
 // safe.
 
-import Local.Uv.Run.run_async
-import Local.Uv.Uv.UvError, uv_error_text
-import Local.Uv.Task.Runtime
-import Local.Uv.Async.Async
-import Local.Uv.Stream.Stream, copy_stream, AsyncWrite, awrite, stream_async_write,
+import Auv.Uv.Run.run_async
+import Auv.Uv.Uv.UvError, uv_error_text
+import Auv.Uv.Task.Runtime
+import Auv.Uv.Async.Async
+import Auv.Uv.Stream.Stream, copy_stream, AsyncWrite, awrite, stream_async_write,
     AsyncRead, aread, stream_async_read, read_all
-import Local.Uv.Proc.Child, copy_child, Exit, copy_exit, exit_code, exit_signal,
+import Auv.Uv.Proc.Child, copy_child, Exit, copy_exit, exit_code, exit_signal,
     exited_normally, spawn_child, wait_exit, child_close, child_close_stdin,
     child_pid, child_stdin, child_stdout, child_stderr,
     SpawnOpts, copy_spawnopts, spawn_opts, spawn_child_with,

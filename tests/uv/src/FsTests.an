@@ -7,13 +7,13 @@
 // Each scenario works inside a directory of its own named after the process, so two copies of
 // the suite running at once cannot collide.
 
-import Local.Harness.TestState, ok, is_i32, is_i64, is_usz
-import Local.Uv.Uv.Completion, copy_completion, handle_is_null, loop_thread_faults,
+import UvTests.Harness.TestState, ok, is_i32, is_i64, is_usz
+import Auv.Uv.Uv.Completion, copy_completion, handle_is_null, loop_thread_faults,
     getpid, as_i64, UvError, uv_error_text
-import Local.Uv.Task.Runtime, rt_new, rt_free, rt_loop, rt_live_count,
+import Auv.Uv.Task.Runtime, rt_new, rt_free, rt_loop, rt_live_count,
     spawn, spawn_default, join, run, shutdown
-import Local.Uv.Async.Async, run_uv, blocking, sleep
-import Local.Uv.Fs.FileInfo, copy_fileinfo, fi_size, fi_is_dir, fi_mtime,
+import Auv.Uv.Async.Async, run_uv, blocking, sleep
+import Auv.Uv.Fs.FileInfo, copy_fileinfo, fi_size, fi_is_dir, fi_mtime,
     fs_open, fs_read, fs_write, fs_close, fs_stat, fs_scandir,
     fs_mkdir, fs_rmdir, fs_unlink, fs_rename, read_file, write_file, resolve,
     DirEntry, fs_scandir_entries,

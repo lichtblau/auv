@@ -1,17 +1,17 @@
 // Child-process suite: pipes in both directions, exit status, signals, adopted descriptors.
 
-import Local.Harness.TestState, ok, is_i32, is_i64, is_usz
-import Local.Uv.Uv.Completion, copy_completion, handle_is_null, loop_thread_faults,
+import UvTests.Harness.TestState, ok, is_i32, is_i64, is_usz
+import Auv.Uv.Uv.Completion, copy_completion, handle_is_null, loop_thread_faults,
     buf_alloc, buf_free, i32_at, socketpair_fds, fd_close, fd_write_string, sigterm,
     as_i64, UvError, uv_error_text
-import Local.Uv.Task.Runtime, rt_new, rt_free, rt_loop, rt_live_count,
+import Auv.Uv.Task.Runtime, rt_new, rt_free, rt_loop, rt_live_count,
     spawn_default, run, shutdown, sleep_ms
-import Local.Uv.Async.Async, run_uv, sleep
-import Local.Uv.Stream.Stream, copy_stream, stream_free, stream_close, stream_adopt_fd,
+import Auv.Uv.Async.Async, run_uv, sleep
+import Auv.Uv.Stream.Stream, copy_stream, stream_free, stream_close, stream_adopt_fd,
     stream_is_null,
     AsyncRead, aread, stream_async_read, AsyncWrite, awrite, stream_async_write,
     ashutdown, read_all
-import Local.Uv.Proc.Child, copy_child, Exit, copy_exit, exit_code, exit_signal,
+import Auv.Uv.Proc.Child, copy_child, Exit, copy_exit, exit_code, exit_signal,
     exited_normally, spawn_child, wait_exit, kill_child, child_close, child_close_stdin, child_pid,
     child_stdin, child_stdout, child_stderr,
     SpawnOpts, copy_spawnopts, spawn_opts, spawn_child_with, child_unref,

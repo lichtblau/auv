@@ -3,13 +3,13 @@
 // Both bind to port 0 and ask the kernel which port they got, so nothing here collides with
 // anything else on the machine.
 
-import Local.Harness.TestState, ok, is_i32, is_i64, is_usz
-import Local.Uv.Uv.UvError, uv_error_text, uv_err_name_of, handle_is_null, loop_alive,
+import UvTests.Harness.TestState, ok, is_i32, is_i64, is_usz
+import Auv.Uv.Uv.UvError, uv_error_text, uv_err_name_of, handle_is_null, loop_alive,
     loop_thread_faults, as_i64, as_u64
-import Local.Uv.Task.Runtime, rt_new, rt_free, rt_loop, rt_live_count, rt_task_count,
+import Auv.Uv.Task.Runtime, rt_new, rt_free, rt_loop, rt_live_count, rt_task_count,
     spawn_default, run, shutdown, sleep_ms
-import Local.Uv.Async.Async, run_uv, blocking, sleep
-import Local.Uv.Udp.Udp, copy_udp, udp_socket, udp_local_port, udp_close,
+import Auv.Uv.Async.Async, run_uv, blocking, sleep
+import Auv.Uv.Udp.Udp, copy_udp, udp_socket, udp_local_port, udp_close,
     udp_recv, udp_send, udp_ref, udp_unref, udp_has_ref,
     udp_try_send_to, udp_connect_to, udp_disconnect, udp_send_to_peer,
     udp_local_addr, udp_peer, udp_peer_at,

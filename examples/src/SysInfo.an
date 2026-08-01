@@ -12,8 +12,8 @@
 // whether anyone is watching: a terminal gets colour, progress and cleared lines, and a pipe
 // gets none of them, because the thing on the other end is a program that has to parse it.
 
-import Local.Uv.Uv.UvError, uv_error_text
-import Local.Uv.Os.hostname, sysname, release, machine, uptime_seconds,
+import Auv.Uv.Uv.UvError, uv_error_text
+import Auv.Uv.Os.hostname, sysname, release, machine, uptime_seconds,
     cpu_count, cpu_model, cpu_speed_mhz, load_average,
     total_memory, free_memory, constrained_memory,
     cwd, exepath, homedir, tmpdir, env_or,

@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Build + run the src/Uv test suite.
 #
-# The suite is its own ante project (name "uv-tests"): an ante project has exactly one main,
-# so a test-runner main needs a project of its own. src/Uv is reached through the checked-in
-# symlink src/Uv -> ../../../src/Uv, which the compiler follows like a real directory.
+# The suite is its own ante project (name "UvTests", so `ante build` leaves a binary of that
+# name here): an ante project has exactly one main, so a test-runner main needs a project of
+# its own. The library is a dependency crate, reached through the checked-in symlink
+# deps/Auv -> ../../.., which the compiler follows like a real directory -- so the suite spells
+# the library's modules `Auv.Uv.*`, exactly as any other consumer would.
 #
 # Runs at BOTH optimization levels by default (see build_and_run below). Pass `asan` for an
 # AddressSanitizer run, or `o3` for just the optimized one. Leak detection stays off at run
@@ -36,7 +38,7 @@ fi
 
 auv_build_shim "$here"
 
-cleanup() { rm -f "$here/uv-tests" "$here/a.out.c" "$here/auv.o" "$here/pc_coro.o"; }
+cleanup() { rm -f "$here/UvTests" "$here/a.out.c" "$here/auv.o" "$here/pc_coro.o"; }
 trap cleanup EXIT
 
 # The suite runs at BOTH optimization levels by default, and that is the point rather than
@@ -51,9 +53,9 @@ build_and_run() {
     mapfile -t link < <(auv_link_flags "$here")
     ante_build "$here" --backend c "$@" "${link[@]}"
     if [ "$mode" = "asan" ]; then
-        ASAN_OPTIONS=detect_leaks=0 "$here/uv-tests"
+        ASAN_OPTIONS=detect_leaks=0 "$here/UvTests"
     else
-        "$here/uv-tests"
+        "$here/UvTests"
     fi
 }
 

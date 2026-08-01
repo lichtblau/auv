@@ -6,9 +6,9 @@
 // binding is doing something of its own: the environment round trip, the descriptor kinds, the
 // interface list it has to parse.
 
-import Local.Harness.TestState, ok, is_i32, is_i64, is_usz
-import Local.Uv.Uv.UvError, uv_error_text, getpid
-import Local.Uv.Os.cwd, chdir, exepath, homedir, tmpdir, hostname,
+import UvTests.Harness.TestState, ok, is_i32, is_i64, is_usz
+import Auv.Uv.Uv.UvError, uv_error_text, getpid
+import Auv.Uv.Os.cwd, chdir, exepath, homedir, tmpdir, hostname,
     sysname, release, machine, uptime_seconds,
     free_memory, total_memory, cpu_count, cpu_model, cpu_speed_mhz, load_average,
     get_env, set_env, unset_env, env_or, parent_pid, priority,

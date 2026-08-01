@@ -31,7 +31,7 @@
 // The symbols are the ones the compiler already links into every binary; an extern
 // declaration is a declaration, and the independence keeps src/Uv self-contained.
 
-import Local.Uv.Uv.Loop, loop_new, loop_run_once, loop_run_nowait, loop_alive,
+import Auv.Uv.Uv.Loop, loop_new, loop_run_once, loop_run_nowait, loop_alive,
     loop_walk_close_all, loop_close_free, loop_null, loop_is_null, copy_loop,
     loop_now, loop_update_time, loop_backend_fd, loop_backend_timeout,
     Slot, slot_new, slot_free, slot_park, slot_completion, slot_post, slot_rearm, copy_slot,

@@ -19,7 +19,7 @@
 // is the first of them), and those report ENOSYS under `blocking` rather than pretending to
 // have happened. Every op that can be satisfied without a loop still is.
 
-import Local.Uv.Uv.Loop, copy_loop, Slot, copy_slot, slot_new, slot_free, slot_rearm,
+import Auv.Uv.Uv.Loop, copy_loop, Slot, copy_slot, slot_new, slot_free, slot_rearm,
     slot_state, slot_completion, st_done,
     Completion, copy_completion,
     completion_none, k_none, k_timer, k_cancelled, k_read, k_write, k_connect, k_connection,
@@ -30,7 +30,7 @@ import Local.Uv.Uv.Loop, copy_loop, Slot, copy_slot, slot_new, slot_free, slot_r
     read_start, stream_write, stream_shutdown, tcp_connect_cstr, pipe_connect_cstr,
     udp_recv_start, udp_send,
     fs_submit, fs_sync, getaddrinfo_start, getaddrinfo_sync, getnameinfo_start, getnameinfo_sync
-import Local.Uv.Task.Runtime, rt_loop, park, park_on, current_slot, task_sleep, task_sleep_unref
+import Auv.Uv.Task.Runtime, rt_loop, park, park_on, current_slot, task_sleep, task_sleep_unref
 import Std.Vec.Vec, len
 
 export

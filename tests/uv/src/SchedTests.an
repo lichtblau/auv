@@ -1,8 +1,8 @@
 // Scheduler suite: everything a task can do besides sleep -- joining, being cancelled,
 // waking on a descriptor or a signal, losing a race, and being torn down.
 
-import Local.Harness.TestState, ok, is_i32, is_i64, is_usz
-import Local.Uv.Uv.Loop, copy_loop, Slot, copy_slot, Completion, copy_completion,
+import UvTests.Harness.TestState, ok, is_i32, is_i64, is_usz
+import Auv.Uv.Uv.Loop, copy_loop, Slot, copy_slot, Completion, copy_completion,
     uv_err_name_of, uv_err_msg_of,
     as_i64, as_u64, k_poll,
     slot_rearm, slot_deliver, slot_new, slot_state, slot_completion, st_empty, st_done,
@@ -16,7 +16,7 @@ import Local.Uv.Uv.Loop, copy_loop, Slot, copy_slot, Completion, copy_completion
     idle_new, idle_start, idle_stop,
     buf_alloc, buf_free, i32_at, pipe_fds, fd_write_string, fd_close,
     uv_check, uv_error_of, UvError, loop_thread_faults
-import Local.Uv.Task.Runtime, rt_new, rt_free, rt_loop, rt_live_count, rt_task_count,
+import Auv.Uv.Task.Runtime, rt_new, rt_free, rt_loop, rt_live_count, rt_task_count,
     spawn, spawn_default, park, join, cancel, wake, abandon, run, step, step_nowait, run_ready,
     has_ready, shutdown, current_slot, current_id, set_result, sleep_ms, task_sleep, ts_reaped,
     task_wait_writable,

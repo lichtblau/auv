@@ -23,14 +23,14 @@
 // it DOWN should `signal_unref` it: otherwise the shutdown watcher is itself the reason the
 // program never finishes.
 
-import Local.Uv.Uv.Loop, copy_loop, Slot, copy_slot, slot_new,
+import Auv.Uv.Uv.Loop, copy_loop, Slot, copy_slot, slot_new,
     Completion, copy_completion, k_cancelled, k_closed,
     UvError, uv_error_of,
     handle_null, handle_is_null, handle_adopt_slot, handle_ref, handle_unref, handle_has_ref,
     close_handle, close_handle_waking,
     signal_new, signal_start, sigint, sigterm, sigusr1, sigusr2
-import Local.Uv.Task.Runtime, rt_loop
-import Local.Uv.Async.Async, submit, Submission, copy_submission, sub_op2, op_signal
+import Auv.Uv.Task.Runtime, rt_loop
+import Auv.Uv.Async.Async, submit, Submission, copy_submission, sub_op2, op_signal
 import Std.C.malloc, free
 
 export

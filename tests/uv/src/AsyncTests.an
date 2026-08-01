@@ -3,12 +3,12 @@
 // The first test is the load-bearing one. Everything else in this file assumes a submission
 // can be performed from under an unrelated handler; `test_forwarding_park` is what proves it.
 
-import Local.Harness.TestState, ok, is_i32, is_i64, is_usz
-import Local.Uv.Uv.Completion, copy_completion, completion_none, k_timer, k_none, k_cancelled,
+import UvTests.Harness.TestState, ok, is_i32, is_i64, is_usz
+import Auv.Uv.Uv.Completion, copy_completion, completion_none, k_timer, k_none, k_cancelled,
     handle_null, handle_is_null, loop_thread_faults, as_i64, as_u64
-import Local.Uv.Task.Runtime, rt_new, rt_free, rt_loop, rt_live_count, rt_task_count,
+import Auv.Uv.Task.Runtime, rt_new, rt_free, rt_loop, rt_live_count, rt_task_count,
     spawn_default, run, shutdown, cancel, current_id, sleep_ms
-import Local.Uv.Async.Async, submit, Submission, copy_submission, sub_op1, op_sleep, op_none,
+import Auv.Uv.Async.Async, submit, Submission, copy_submission, sub_op1, op_sleep, op_none,
     run_uv, blocking, mock, sleep, sleep_result, sleep_unref, perform_blocking
 import Std.Vec.Vec, empty, push, len
 import Std.C.malloc, free

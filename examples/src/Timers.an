@@ -10,11 +10,11 @@
 // on a timer that is not a reason for the program to stay alive) and a Ticker (a schedule that
 // keeps its own time rather than starting again from whenever the task got round to asking).
 
-import Local.Uv.Run.run_async, spawn_async
-import Local.Uv.Task.Runtime, rt_now
-import Local.Uv.Async.Async, sleep, sleep_unref
-import Local.Uv.Timer.Ticker, copy_ticker, ticker_every, await_tick, ticker_close
-import Local.Uv.Uv.UvError, uv_error_text
+import Auv.Uv.Run.run_async, spawn_async
+import Auv.Uv.Task.Runtime, rt_now
+import Auv.Uv.Async.Async, sleep, sleep_unref
+import Auv.Uv.Timer.Ticker, copy_ticker, ticker_every, await_tick, ticker_close
+import Auv.Uv.Uv.UvError, uv_error_text
 
 // A ticker is identified by a number, and its schedule follows from it.
 every_ms (id: I64): U64 = if id == 1 then 120u64 else if id == 2 then 200u64 else 350u64

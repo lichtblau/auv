@@ -11,11 +11,11 @@
 // carries the server and every client at once, and a datagram that arrives with nobody parked
 // waits in the kernel rather than being thrown away.
 
-import Local.Uv.Run.run_async, spawn_async
-import Local.Uv.Uv.UvError, uv_error_text
-import Local.Uv.Task.Runtime
-import Local.Uv.Async.Async, sleep
-import Local.Uv.Udp.Udp, copy_udp, udp_socket, udp_local_port, udp_close,
+import Auv.Uv.Run.run_async, spawn_async
+import Auv.Uv.Uv.UvError, uv_error_text
+import Auv.Uv.Task.Runtime
+import Auv.Uv.Async.Async, sleep
+import Auv.Uv.Udp.Udp, copy_udp, udp_socket, udp_local_port, udp_close,
     udp_recv, udp_send, udp_unref,
     Datagram, dg_from, dg_port, dg_data
 

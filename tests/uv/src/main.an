@@ -1,16 +1,16 @@
 import Std.C.exit
-import Local.Harness.TestState, new_state, report, failed_count
-import Local.TaskTests.run_task_tests
-import Local.SchedTests.run_sched_tests
-import Local.AsyncTests.run_async_tests
-import Local.StreamTests.run_stream_tests
-import Local.SignalTests.run_signal_tests
-import Local.UdpTests.run_udp_tests
-import Local.WatchTests.run_watch_tests
-import Local.TimerTests.run_timer_tests
-import Local.OsTests.run_os_tests
-import Local.FsTests.run_fs_tests
-import Local.ProcTests.run_proc_tests
+import UvTests.Harness.TestState, new_state, report, failed_count
+import UvTests.TaskTests.run_task_tests
+import UvTests.SchedTests.run_sched_tests
+import UvTests.AsyncTests.run_async_tests
+import UvTests.StreamTests.run_stream_tests
+import UvTests.SignalTests.run_signal_tests
+import UvTests.UdpTests.run_udp_tests
+import UvTests.WatchTests.run_watch_tests
+import UvTests.TimerTests.run_timer_tests
+import UvTests.OsTests.run_os_tests
+import UvTests.FsTests.run_fs_tests
+import UvTests.ProcTests.run_proc_tests
 
 main () =
     var t = new_state ()
